@@ -105,3 +105,22 @@
     display: block;
     opacity: 0.85;
 }
+
+.cu_field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.95em;
+}
+
+.cu_dialog select.text_pole,
+#cu_settings select.text_pole {
+    width: 100%;
+    margin: 0;
+    font-size: 16px;
+}
+
+#cu_settings .cu_set_title {
+    margin-top: 8px;
+    font-weight: bold;
+}
