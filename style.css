@@ -1,0 +1,107 @@
+/* Card Updater */
+
+/* SillyTavern's .checkbox_label { display: flex } would otherwise beat [hidden] */
+.cu_dialog [hidden] {
+    display: none !important;
+}
+
+.cu_dialog {
+    text-align: left;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.cu_dialog h3 {
+    margin: 0;
+    text-align: center;
+}
+
+.cu_dialog code {
+    word-break: break-all;
+}
+
+.cu_row {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+}
+
+.cu_section {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 10px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 10px;
+}
+
+.cu_head {
+    font-weight: bold;
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+
+.cu_note {
+    font-size: 0.9em;
+    opacity: 0.85;
+}
+
+.cu_dialog .text_pole.cu_target {
+    width: 100%;
+    margin: 0;
+    font-size: 16px; /* 16px+ keeps iOS Safari from zooming in on focus */
+}
+
+.cu_dialog .text_pole.cu_target:disabled {
+    opacity: 0.5;
+}
+
+.cu_warn,
+.cu_report .cu_warn i,
+.cu_bad {
+    color: var(--warning, #e8a33d);
+}
+
+.cu_warn {
+    font-size: 0.95em;
+}
+
+.cu_report ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.cu_report li {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+}
+
+.cu_report li > i {
+    flex: 0 0 1.1em;
+    text-align: center;
+}
+
+.cu_report .cu_ok i {
+    color: var(--active, #5fbf6c);
+}
+
+.cu_report .cu_info i {
+    opacity: 0.7;
+}
+
+#cu_settings .cu_set_btn {
+    display: flex;
+    margin: 8px 0;
+}
+
+#cu_settings small {
+    display: block;
+    opacity: 0.85;
+}
