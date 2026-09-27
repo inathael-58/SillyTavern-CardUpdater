@@ -17,6 +17,7 @@
 
 const MODULE = 'card_updater';
 const LOG = '[CardUpdater]';
+const VERSION = '1.2.0'; // keep in step with manifest.json
 const CARD_EXT = ['png', 'json', 'charx', 'yaml', 'yml', 'byaf'];
 
 const DEFAULTS = Object.freeze({
@@ -1051,7 +1052,7 @@ function addSettings() {
     wrap.innerHTML = `
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
-                <b>Card Updater</b>
+                <b>Card Updater <small class="cu_version">v${VERSION}</small></b>
                 <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
             </div>
             <div class="inline-drawer-content">
@@ -1093,7 +1094,29 @@ function init() {
     addSettings();
     const { eventSource, event_types: E } = ctx();
     if (E?.APP_READY) eventSource.on(E.APP_READY, () => { addPanelButton(); addSettings(); });
-    console.log(LOG, 'loaded');
+    console.log(LOG, `v${VERSION} loaded`);
+    checkStale();
+}
+
+/**
+ * The browser can keep running an old index.js after the extension was updated on the server.
+ * Compare with the manifest on the server (bypassing the cache) and say so if they differ.
+ */
+async function checkStale() {
+    try {
+        const url = new URL('manifest.json', import.meta.url);
+        url.searchParams.set('t', Date.now());
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) return;
+        const latest = String((await res.json())?.version ?? '');
+        if (!latest || latest === VERSION) return;
+        console.warn(LOG, `running v${VERSION}, server has v${latest}`);
+        globalThis.toastr?.warning(
+            `เซิร์ฟเวอร์มี v${esc(latest)} แล้ว แต่หน้าเว็บยังใช้ v${esc(VERSION)} อยู่ — รีเฟรชหน้า (ถ้ายังไม่เปลี่ยน ให้ล้างแคชของเบราว์เซอร์)`,
+            'Card Updater', { timeOut: 0, extendedTimeOut: 0, closeButton: true });
+    } catch (e) {
+        console.debug(LOG, 'version check skipped', e);
+    }
 }
 
 globalThis.CardUpdater = { readPngCard, writePngCard, cardInfo, jsonKind, loreDiff, mergeRegex, cardRegexAfter, onFilesPicked };

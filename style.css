@@ -124,3 +124,8 @@
     margin-top: 8px;
     font-weight: bold;
 }
+
+#cu_settings .cu_version {
+    opacity: 0.6;
+    font-weight: normal;
+}
