@@ -4,7 +4,8 @@
  * One button in the character panel. Pick one or more files — it tells what each one is:
  *   • a character card  → replaces the open character but keeps its file name, so every
  *     chat stays linked; the lorebook embedded in the card overwrites the linked one
- *     (same name, no version bumps); the card's regex is allowed; a .json keeps the avatar;
+ *     (same name, no version bumps); the card's regex is allowed, and the old scripts the new
+ *     card doesn't have are kept (unless asked to drop them); a .json keeps the avatar;
  *   • a lorebook (.json) → overwrites the lorebook linked to the character (or any you name);
  *   • regex (.json, one script or a list) → replaces the scripts with the same names and adds
  *     new ones, in the character's regex or the global list.
@@ -21,9 +22,9 @@ const CARD_EXT = ['png', 'json', 'charx', 'yaml', 'yml', 'byaf'];
 const DEFAULTS = Object.freeze({
     updateLore: true,
     allowRegex: true,
-    keepOldRegex: true,
     keepAvatar: true,
-    regexMode: 'merge',        // 'merge' | 'replace'
+    regexMode: 'merge',        // regex file: 'merge' | 'replace'
+    cardRegexMode: 'merge',    // new card: 'merge' keeps old scripts the card doesn't have | 'replace' uses the card's set
     loreFromFile: Object.freeze({}), // world name -> true when its last update came from a lorebook file
 });
 
@@ -39,6 +40,7 @@ function settings() {
         if (typeof s[k] !== typeof v || (v && typeof v === 'object' && (!s[k] || Array.isArray(s[k])))) s[k] = v && typeof v === 'object' ? { ...v } : v;
     }
     if (!['merge', 'replace'].includes(s.regexMode)) s.regexMode = 'merge';
+    if (!['merge', 'replace'].includes(s.cardRegexMode)) s.cardRegexMode = 'merge';
     return s;
 }
 
@@ -427,7 +429,6 @@ function planDialog(items, old) {
     const inGlobal = incomingNames.filter(n => regexNames(globalRegex()).includes(n));
     const inScoped = incomingNames.filter(n => regexNames(scopedNow).includes(n));
     const defaultRegexTarget = !hasChar ? 'global' : (inGlobal.length && !inScoped.length ? 'global' : 'scoped');
-    const regexLost = !regexFromFile && card && hasChar && old.regex.length > 0 && (!next || next.regex.length === 0);
 
     const el = document.createElement('div');
     el.className = 'cu_dialog';
@@ -486,19 +487,28 @@ function planDialog(items, old) {
                 </select>
             </label>
             <div class="cu_note cu_rx_preview"></div>
-            ${hasChar ? '<label class="checkbox_label cu_allow_row"><input type="checkbox" class="cu_allow"> อนุญาตให้ regex ของการ์ดนี้ทำงาน</label>' : ''}
-        </div>` : card ? `
+            ${hasChar && !card ? '<label class="checkbox_label cu_allow_row"><input type="checkbox" class="cu_allow"> อนุญาตให้ regex ของการ์ดนี้ทำงาน</label>' : ''}
+        </div>` : '';
+
+    const cardRegexBlock = card ? `
         <div class="cu_section">
             <div class="cu_head"><i class="fa-solid fa-code"></i> Regex ของการ์ด</div>
-            <div class="cu_note">${!next ? `เดิมมี ${old.regex.length} ตัว · ของใหม่จะเช็คหลังอัปโหลด` : `ในไฟล์ <b>${next.regex.length}</b> ตัว (เดิม ${old.regex.length} ตัว)`}</div>
+            <div class="cu_note">${!next ? `เดิมมี ${old.regex.length} ตัว · ของใหม่จะเช็คหลังอัปโหลด` : `ในการ์ดใหม่ <b>${next.regex.length}</b> ตัว (เดิม ${old.regex.length} ตัว)`}</div>
+            ${old.regex.length ? `<label class="cu_field">regex เดิมที่ไม่อยู่ในการ์ดใหม่
+                <select class="text_pole cu_card_rx_mode">
+                    <option value="merge">คงไว้ (แทนตัวชื่อซ้ำ + เพิ่มตัวใหม่)</option>
+                    <option value="replace">ลบทิ้ง (ใช้ตามการ์ดใหม่ทั้งชุด)</option>
+                </select>
+            </label>
+            <div class="cu_note cu_card_rx_preview"></div>` : ''}
             <label class="checkbox_label"><input type="checkbox" class="cu_allow"> อนุญาตให้ regex ของการ์ดนี้ทำงาน</label>
-            ${regexLost ? `<label class="checkbox_label"><input type="checkbox" class="cu_keep_regex"> ถ้าไฟล์ใหม่ไม่มี regex ให้ใส่ของเดิม ${old.regex.length} ตัวกลับเข้าไป</label>` : ''}
         </div>` : '';
 
     el.innerHTML = `
         <h3>${title}</h3>
         ${cardBlock}
         ${loreBlock}
+        ${cardRegexBlock}
         ${regexBlock}
         <div class="cu_note">กด “ย้อนกลับ” ในหน้าสรุปได้ ถ้าเลือกผิดไฟล์</div>`;
 
@@ -551,13 +561,33 @@ function planDialog(items, old) {
     }
 
     // ---- regex controls
+    const cardMode = () => $('.cu_card_rx_mode')?.value ?? s.cardRegexMode;
+    const cardRxPreview = () => {
+        if (!has('.cu_card_rx_preview')) return;
+        const mode = cardMode();
+        if (!next) {
+            $('.cu_card_rx_preview').innerHTML = mode === 'merge'
+                ? `ตัวที่ชื่อตรงกันจะใช้ของการ์ดใหม่ ตัวเดิมที่การ์ดใหม่ไม่มีจะคงไว้`
+                : `<span class="cu_bad">ใช้ regex ตามการ์ดใหม่ ตัวเดิมที่การ์ดใหม่ไม่มีจะถูกลบ</span>`;
+            return;
+        }
+        const oldNames = regexNames(old.regex), newNames = regexNames(next.regex);
+        const replaced = newNames.filter(n => oldNames.includes(n));
+        const added = newNames.filter(n => !oldNames.includes(n));
+        const others = oldNames.filter(n => !newNames.includes(n));
+        const parts = [];
+        if (replaced.length) parts.push(`แทน ${replaced.length}: ${listNames(replaced, 4)}`);
+        if (added.length) parts.push(`เพิ่มใหม่ ${added.length}: ${listNames(added, 4)}`);
+        if (others.length) parts.push(mode === 'merge' ? `คงไว้ ${others.length}: ${listNames(others, 4)}` : `<span class="cu_bad">ลบ ${others.length}: ${listNames(others, 4)}</span>`);
+        $('.cu_card_rx_preview').innerHTML = parts.join('<br>');
+    };
     const rxPreview = () => {
         if (!has('.cu_rx_target')) return;
         const target = $('.cu_rx_target').value, mode = $('.cu_rx_mode').value;
         if (has('.cu_allow_row')) $('.cu_allow_row').hidden = target !== 'scoped';
         // With a new card, the card's own scoped regex is what we merge into.
         if (target === 'scoped' && card && !next) { $('.cu_rx_preview').innerHTML = 'จะรวมกับ regex ของการ์ดใหม่หลังอัปโหลด'; return; }
-        const base = target === 'global' ? globalRegex() : (card && next ? next.regex : scopedNow);
+        const base = target === 'global' ? globalRegex() : (card && next ? cardRegexAfter(old.regex, next.regex, cardMode()).result : scopedNow);
         const baseNames = regexNames(base);
         const replaced = incomingNames.filter(n => baseNames.includes(n));
         const added = incomingNames.filter(n => !baseNames.includes(n));
@@ -575,8 +605,12 @@ function planDialog(items, old) {
         $('.cu_rx_mode').addEventListener('change', rxPreview);
         rxPreview();
     }
+    if (has('.cu_card_rx_mode')) {
+        $('.cu_card_rx_mode').value = s.cardRegexMode;
+        $('.cu_card_rx_mode').addEventListener('change', () => { cardRxPreview(); rxPreview(); });
+        cardRxPreview();
+    }
     if (has('.cu_allow')) $('.cu_allow').checked = s.allowRegex;
-    if (has('.cu_keep_regex')) $('.cu_keep_regex').checked = s.keepOldRegex;
     if (has('.cu_keep_avatar')) $('.cu_keep_avatar').checked = s.keepAvatar;
 
     const read = () => ({
@@ -593,8 +627,8 @@ function planDialog(items, old) {
             source: regexFromFile ? 'file' : 'card',
             target: $('.cu_rx_target')?.value ?? 'scoped',
             mode: $('.cu_rx_mode')?.value ?? s.regexMode,
+            cardMode: cardMode(),
             allow: $('.cu_allow')?.checked ?? false,
-            keepOld: $('.cu_keep_regex')?.checked ?? s.keepOldRegex,
         },
     });
     return { el, read };
@@ -627,7 +661,7 @@ async function askPlan(items, old) {
     const shown = sel => { const n = el.querySelector(sel); return !!n && !n.closest('[hidden]'); };
     if (shown('.cu_lore') && plan.lore.source === 'card' && !plan.lore.staleDefaultOff) s.updateLore = plan.lore.apply;
     if (shown('.cu_allow')) s.allowRegex = plan.regex.allow;
-    if (shown('.cu_keep_regex')) s.keepOldRegex = plan.regex.keepOld;
+    if (shown('.cu_card_rx_mode')) s.cardRegexMode = plan.regex.cardMode;
     if (shown('.cu_keep_avatar')) s.keepAvatar = plan.keepAvatar;
     if (shown('.cu_rx_mode')) s.regexMode = plan.regex.mode;
     save();
@@ -665,6 +699,18 @@ function mergeRegex(base, incoming, mode) {
         if (!baseByName.has(regexName(s))) { result.push(fresh(s)); added.push(regexName(s)); }
     }
     return { result, replaced, added, removed, kept: mode === 'merge' ? base.length - replaced.length : 0 };
+}
+
+/**
+ * The character's regex after a new card is imported: the card's scripts, and in 'merge' also the old
+ * scripts the card doesn't have (old order kept, the card's new ones at the end). `kept` names those.
+ */
+function cardRegexAfter(oldList, cardList, mode) {
+    if (mode !== 'merge' || !oldList.length) return { result: cardList, kept: [] };
+    const m = mergeRegex(oldList, cardList, 'merge');
+    if (!m.kept) return { result: cardList, kept: [] };
+    const cardNames = new Set(regexNames(cardList));
+    return { result: m.result, kept: regexNames(oldList).filter(n => !cardNames.has(n)), keptCount: m.kept };
 }
 
 async function runUpdate(items, old, plan) {
@@ -767,6 +813,44 @@ async function runUpdate(items, old, plan) {
     }
 
     // --- regex
+    // A new card first: its scripts, plus the old ones it doesn't have (unless asked to drop them).
+    if (items.card) {
+        const fromCard = now.regex;
+        const after = cardRegexAfter(old.regex, fromCard, plan.regex.cardMode);
+        const scripts = after.result;
+        if (after.keptCount) {
+            await c.writeExtensionField(chid, 'regex_scripts', structuredClone(scripts));
+            now.regex = scripts;
+            report.push(line('info', fromCard.length
+                ? `คง regex เดิมที่ไม่อยู่ในการ์ดใหม่ไว้ ${after.keptCount} ตัว${after.kept.length ? `: ${listNames(after.kept)}` : ''}`
+                : `การ์ดใหม่ไม่มี regex · คงของเดิม ${after.keptCount} ตัวไว้`));
+        }
+        if (scripts.length) {
+            const off = scripts.filter(x => x?.disabled).length;
+            let msg = `Regex ของการ์ด <b>${scripts.length}</b> ตัว${off ? ` (ปิดไว้ ${off})` : ''}`;
+            let kind = 'ok';
+            if (plan.regex.allow) {
+                setRegexAllowed(old.avatar, true);
+                msg += ' · อนุญาตให้ทำงานแล้ว';
+            } else if (isRegexAllowed(old.avatar)) {
+                msg += ' · อนุญาตอยู่แล้ว';
+            } else {
+                msg += ' · <b>ยังไม่ได้อนุญาต</b>';
+                kind = 'warn';
+            }
+            report.push(line(kind, msg));
+            const oldN = regexNames(old.regex), newN = regexNames(scripts);
+            const added = newN.filter(n => !oldN.includes(n));
+            const removed = oldN.filter(n => !newN.includes(n));
+            if (added.length) report.push(line('info', `regex ใหม่: ${listNames(added)}`));
+            if (removed.length) report.push(line('warn', `regex ที่ลบออก: ${listNames(removed)}`));
+        } else if (old.regex.length) {
+            report.push(line('warn', `การ์ดใหม่ไม่มี regex · ของเดิม ${old.regex.length} ตัวถูกลบ`));
+        } else {
+            report.push(line('info', 'การ์ดนี้ไม่มี regex'));
+        }
+    }
+
     if (plan.regex.source === 'file' && items.regex) {
         const incoming = items.regex.scripts;
         if (plan.regex.target === 'global') {
@@ -779,50 +863,19 @@ async function runUpdate(items, old, plan) {
             const base = now.regex;
             const m = mergeRegex(base, incoming, plan.regex.mode);
             await c.writeExtensionField(chid, 'regex_scripts', m.result);
+            now.regex = m.result;
             undo.cardTouched = true;
             let msg = `Regex ของการ์ด: ${regexReportText(m)}`;
             let kind = 'ok';
-            if (plan.regex.allow) { setRegexAllowed(old.avatar, true); msg += '<br><small>อนุญาตให้ทำงานแล้ว</small>'; }
-            else if (!isRegexAllowed(old.avatar)) { msg += '<br><small><b>ยังไม่ได้อนุญาต</b>ให้ทำงาน</small>'; kind = 'warn'; }
+            // With a new card, allowing was already reported above.
+            if (!items.card) {
+                if (plan.regex.allow) { setRegexAllowed(old.avatar, true); msg += '<br><small>อนุญาตให้ทำงานแล้ว</small>'; }
+                else if (!isRegexAllowed(old.avatar)) { msg += '<br><small><b>ยังไม่ได้อนุญาต</b>ให้ทำงาน</small>'; kind = 'warn'; }
+            }
             report.push(line(kind, msg));
         }
         const off = incoming.filter(x => x?.disabled).length;
         if (off) report.push(line('info', `ในไฟล์มี regex ที่ปิดไว้ ${off} ตัว`));
-    } else if (items.card) {
-        let scripts = now.regex;
-        if (!scripts.length && old.regex.length) {
-            if (plan.regex.keepOld) {
-                await c.writeExtensionField(chid, 'regex_scripts', structuredClone(old.regex));
-                scripts = old.regex;
-                report.push(line('warn', `ไฟล์ใหม่ไม่มี regex · ใส่ของเดิม ${old.regex.length} ตัวกลับเข้าไปแล้ว`));
-            } else {
-                report.push(line('warn', `ไฟล์ใหม่ไม่มี regex · ของเดิม ${old.regex.length} ตัวหายไป`));
-            }
-        }
-        if (scripts.length) {
-            const off = scripts.filter(x => x?.disabled).length;
-            let msg = `Regex ในการ์ด <b>${scripts.length}</b> ตัว${off ? ` (ปิดไว้ ${off})` : ''}`;
-            let kind = 'ok';
-            if (plan.regex.allow) {
-                setRegexAllowed(old.avatar, true);
-                msg += ' · อนุญาตให้ทำงานแล้ว';
-            } else if (isRegexAllowed(old.avatar)) {
-                msg += ' · อนุญาตอยู่แล้ว';
-            } else {
-                msg += ' · <b>ยังไม่ได้อนุญาต</b>';
-                kind = 'warn';
-            }
-            report.push(line(kind, msg));
-            if (scripts !== old.regex) {
-                const oldN = regexNames(old.regex), newN = regexNames(scripts);
-                const added = newN.filter(n => !oldN.includes(n));
-                const removed = oldN.filter(n => !newN.includes(n));
-                if (added.length) report.push(line('info', `regex ใหม่: ${listNames(added)}`));
-                if (removed.length) report.push(line('warn', `regex ที่หายไป: ${listNames(removed)}`));
-            }
-        } else if (!old.regex.length) {
-            report.push(line('info', 'การ์ดนี้ไม่มี regex'));
-        }
     }
 
     if (old && chid !== undefined) {
@@ -1007,8 +1060,13 @@ function addSettings() {
                 <div class="cu_set_title">ค่าเริ่มต้นของหน้าต่างอัปเดต</div>
                 <label class="checkbox_label"><input type="checkbox" data-key="updateLore"> การ์ด: เขียน lorebook ที่ฝังมาทับของเดิม</label>
                 <label class="checkbox_label"><input type="checkbox" data-key="allowRegex"> อนุญาต regex ของการ์ดอัตโนมัติ</label>
-                <label class="checkbox_label"><input type="checkbox" data-key="keepOldRegex"> การ์ด: ถ้าไฟล์ใหม่ไม่มี regex ให้ใส่ของเดิมกลับ</label>
                 <label class="checkbox_label"><input type="checkbox" data-key="keepAvatar"> การ์ด .json ใช้รูปตัวละครเดิม</label>
+                <label class="cu_field">การ์ดใหม่: regex เดิมที่ไม่อยู่ในการ์ด
+                    <select class="text_pole" data-key="cardRegexMode">
+                        <option value="merge">คงไว้</option>
+                        <option value="replace">ลบทิ้ง (ใช้ตามการ์ดใหม่ทั้งชุด)</option>
+                    </select>
+                </label>
                 <label class="cu_field">ไฟล์ regex
                     <select class="text_pole" data-key="regexMode">
                         <option value="merge">แทนตัวที่ชื่อซ้ำ + เพิ่มตัวใหม่</option>
@@ -1038,6 +1096,6 @@ function init() {
     console.log(LOG, 'loaded');
 }
 
-globalThis.CardUpdater = { readPngCard, writePngCard, cardInfo, jsonKind, loreDiff, mergeRegex, onFilesPicked };
+globalThis.CardUpdater = { readPngCard, writePngCard, cardInfo, jsonKind, loreDiff, mergeRegex, cardRegexAfter, onFilesPicked };
 
 if (typeof jQuery === 'function') jQuery(init); else init();
