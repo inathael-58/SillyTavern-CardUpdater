@@ -126,6 +126,7 @@
 }
 
 #cu_settings .cu_version {
+    display: inline;
     opacity: 0.6;
     font-weight: normal;
 }

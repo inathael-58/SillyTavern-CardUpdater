@@ -17,7 +17,8 @@
 
 const MODULE = 'card_updater';
 const LOG = '[CardUpdater]';
-const VERSION = '1.2.0'; // keep in step with manifest.json
+const VERSION = '1.2.1'; // keep in sync with manifest.json
+const BASE_URL = new URL('.', import.meta.url);
 const CARD_EXT = ['png', 'json', 'charx', 'yaml', 'yml', 'byaf'];
 
 const DEFAULTS = Object.freeze({
@@ -1094,31 +1095,49 @@ function init() {
     addSettings();
     const { eventSource, event_types: E } = ctx();
     if (E?.APP_READY) eventSource.on(E.APP_READY, () => { addPanelButton(); addSettings(); });
-    console.log(LOG, `v${VERSION} loaded`);
-    checkStale();
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') checkForNewVersion(); });
+    setTimeout(checkForNewVersion, 3000);
+    console.log(LOG, 'loaded', `v${VERSION}`);
 }
 
-/**
- * The browser can keep running an old index.js after the extension was updated on the server.
- * Compare with the manifest on the server (bypassing the cache) and say so if they differ.
- */
-async function checkStale() {
+// ---------------------------------------------------------------- stale-code check
+//
+// SillyTavern loads extension files by a fixed URL, and a home-screen web app
+// on iOS rarely does a real reload, so after "Update" the old code can keep
+// running for a long time. Compare with the manifest on the server; if it is
+// newer, refresh the cached files explicitly and reload.
+
+let versionCheckedAt = 0;
+let versionToastShown = false;
+
+async function checkForNewVersion() {
+    if (versionToastShown || Date.now() - versionCheckedAt < 10 * 60_000) return;
+    versionCheckedAt = Date.now();
+    let remote;
     try {
-        const url = new URL('manifest.json', import.meta.url);
-        url.searchParams.set('t', Date.now());
-        const res = await fetch(url, { cache: 'no-store' });
+        const res = await fetch(new URL('manifest.json', BASE_URL), { cache: 'no-store' });
         if (!res.ok) return;
-        const latest = String((await res.json())?.version ?? '');
-        if (!latest || latest === VERSION) return;
-        console.warn(LOG, `running v${VERSION}, server has v${latest}`);
-        globalThis.toastr?.warning(
-            `เซิร์ฟเวอร์มี v${esc(latest)} แล้ว แต่หน้าเว็บยังใช้ v${esc(VERSION)} อยู่ — รีเฟรชหน้า (ถ้ายังไม่เปลี่ยน ให้ล้างแคชของเบราว์เซอร์)`,
-            'Card Updater', { timeOut: 0, extendedTimeOut: 0, closeButton: true });
-    } catch (e) {
-        console.debug(LOG, 'version check skipped', e);
+        remote = String((await res.json())?.version ?? '');
+    } catch { return; }
+    if (!remote || remote === VERSION) return;
+    versionToastShown = true;
+    globalThis.toastr?.info(`ติดตั้ง v${esc(remote)} ไว้แล้ว แต่หน้านี้ยังรัน v${VERSION} อยู่<br>แตะที่นี่เพื่อโหลดเวอร์ชันใหม่`, 'Card Updater', {
+        timeOut: 0, extendedTimeOut: 0, closeButton: true, escapeHtml: false,
+        onclick: () => reloadWithFreshFiles(),
+    });
+}
+
+async function reloadWithFreshFiles() {
+    try {
+        // cache: 'reload' fetches from the server and overwrites the browser's cached copy,
+        // so the page reload below picks up the new files.
+        await Promise.all(['index.js', 'style.css', 'manifest.json'].map(f =>
+            fetch(new URL(f, BASE_URL), { cache: 'reload' }).catch(() => null)));
+    } finally {
+        location.reload();
     }
 }
 
-globalThis.CardUpdater = { readPngCard, writePngCard, cardInfo, jsonKind, loreDiff, mergeRegex, cardRegexAfter, onFilesPicked };
+globalThis.CardUpdater = { VERSION, checkForNewVersion, reloadWithFreshFiles, readPngCard, writePngCard, cardInfo, jsonKind, loreDiff, mergeRegex, cardRegexAfter, onFilesPicked };
 
 if (typeof jQuery === 'function') jQuery(init); else init();
