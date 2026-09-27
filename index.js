@@ -9,6 +9,8 @@
  *   • a lorebook (.json) → overwrites the lorebook linked to the character (or any you name);
  *   • regex (.json, one script or a list) → replaces the scripts with the same names and adds
  *     new ones, in the character's regex or the global list.
+ *   • a card with Tavern Helper (JS-Slash-Runner) scripts or a `card_updater` manifest → updated
+ *     piece by piece instead of re-imported, so the player's progress and settings stay (see below).
  * One dialog before, one summary after, with an Undo button.
  *
  * It is a real button (a <label> around a file input), so the file picker also
@@ -17,7 +19,7 @@
 
 const MODULE = 'card_updater';
 const LOG = '[CardUpdater]';
-const VERSION = '1.2.1'; // keep in sync with manifest.json
+const VERSION = '1.3.0'; // keep in sync with manifest.json
 const BASE_URL = new URL('.', import.meta.url);
 const CARD_EXT = ['png', 'json', 'charx', 'yaml', 'yml', 'byaf'];
 
@@ -26,6 +28,7 @@ const DEFAULTS = Object.freeze({
     allowRegex: true,
     keepAvatar: true,
     regexMode: 'merge',        // regex file: 'merge' | 'replace'
+    useCardImage: true,        // Tavern Helper card (.png): take the new card's picture
     cardRegexMode: 'merge',    // new card: 'merge' keeps old scripts the card doesn't have | 'replace' uses the card's set
     loreFromFile: Object.freeze({}), // world name -> true when its last update came from a lorebook file
 });
@@ -927,7 +930,11 @@ async function runUndo(undo) {
     }
     if (undo.avatar && undo.allowed !== null) setRegexAllowed(undo.avatar, undo.allowed);
     const chid = undo.avatar ? await reopen(undo.avatar) : undefined;
-    if (chid !== undefined) await showAgain(chid, undo.chat); else await refreshChat();
+    // Tavern Helper still holds the updated scripts of the open card; hand it the old ones.
+    if (chid !== undefined && undo.thTrees && typeof globalThis.TavernHelper?.replaceScriptTrees === 'function') {
+        try { globalThis.TavernHelper.replaceScriptTrees(undo.thTrees, { type: 'character' }); } catch (e) { console.warn(LOG, 'could not restore Tavern Helper scripts', e); }
+    }
+    if (chid !== undefined && undo.show !== false) await showAgain(chid, undo.chat); else await refreshChat();
     toast.ok(notes.join(' · ') || 'ย้อนกลับแล้ว');
 }
 
@@ -935,7 +942,7 @@ async function showReport(result) {
     const c = ctx();
     const el = document.createElement('div');
     el.className = 'cu_dialog cu_report';
-    el.innerHTML = `<h3>อัปเดตเสร็จแล้ว</h3>
+    el.innerHTML = `<h3>${esc(result.title ?? 'อัปเดตเสร็จแล้ว')}</h3>
         <ul>${result.report.map(r => `<li class="cu_${r.kind}"><i class="fa-solid ${ICON[r.kind]}"></i><span>${r.html}</span></li>`).join('')}</ul>`;
     const UNDO = c.POPUP_RESULT.CUSTOM1;
     const u = result.undo;
@@ -959,6 +966,656 @@ async function withLoader(fn) {
     } finally {
         try { await c.hideLoader?.(); } catch { /* ignore */ }
     }
+}
+
+// ---------------------------------------------------------------- cards with Tavern Helper scripts
+//
+// A card that carries Tavern Helper (JS-Slash-Runner) scripts or a `card_updater` manifest is not
+// re-imported: that would wipe what belongs to the player (scripts on/off and their data, card
+// variables, regex on/off, lorebook entries they added). It is updated piece by piece instead:
+//   • card fields and the embedded lorebook through /merge-attributes;
+//   • regex: the card's own scripts (by id) get the new pattern, `disabled` stays;
+//   • the linked lorebook file: the card's own entries (by comment) are rewritten keeping their uid
+//     and on/off, new ones are added, the player's entries are left alone;
+//   • scripts: the card's own scripts (by id, also inside folders) get the new content, name, info
+//     and buttons; on/off, data, export_with and button visibility stay. For the open character this
+//     goes through Tavern Helper, which holds the card in memory and writes it back on every change;
+//   • the new manifest last, as the "update finished" mark.
+// Chat variables, card variables and the player's permissions are never touched.
+
+const TH_FIELD = 'tavern_helper';
+const REGEX_OVERWRITE = ['scriptName', 'findRegex', 'replaceString', 'trimStrings', 'placement', 'markdownOnly', 'promptOnly', 'runOnEdit', 'substituteRegex', 'minDepth', 'maxDepth'];
+const CARD_V1_FIELDS = ['description', 'personality', 'scenario', 'first_mes', 'mes_example'];
+const CARD_DATA_FIELDS = [...CARD_V1_FIELDS, 'creator_notes', 'system_prompt', 'post_history_instructions', 'alternate_greetings', 'tags', 'creator', 'character_version'];
+
+const cardData = card => (card?.data && typeof card.data === 'object' ? card.data : (card ?? {}));
+const strList = v => (Array.isArray(v) ? v.map(String) : []);
+const sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const isPlainObject = v => !!v && typeof v === 'object' && !Array.isArray(v);
+const entryName = e => String(e?.comment ?? '');
+
+/** The `card_updater` manifest of a card's data, normalized, or null. */
+function cardManifest(data) {
+    const m = data?.extensions?.card_updater;
+    if (!isPlainObject(m)) return null;
+    return {
+        raw: m,
+        botId: String(m.bot_id ?? '').trim(),
+        version: String(m.version ?? '').trim(),
+        scripts: strList(m.tavern_helper_scripts),
+        regex: strList(m.regex_scripts),
+        owned: strList(m.lorebook?.owned_entries),
+        forceOff: strList(m.lorebook?.force_disabled),
+    };
+}
+
+/** -1 / 0 / 1, comparing the numbers in two version strings ("0.1.3" < "0.1.10"). */
+function compareVersions(a, b) {
+    const pa = String(a).match(/\d+/g)?.map(Number) ?? [];
+    const pb = String(b).match(/\d+/g)?.map(Number) ?? [];
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+        if (d) return Math.sign(d);
+    }
+    return 0;
+}
+
+const flattenTrees = trees => (Array.isArray(trees) ? trees : [])
+    .flatMap(t => (t?.type === 'folder' ? (Array.isArray(t.scripts) ? t.scripts : []) : [t]))
+    .filter(s => isPlainObject(s) && s.type !== 'folder');
+
+/** Scripts stored in the fields Tavern Helper used before 4.x, in today's shape. */
+function fromLegacyScripts(list) {
+    const one = s => {
+        const v = s?.type === 'script' && isPlainObject(s.value) ? s.value : (s ?? {});
+        return {
+            type: 'script',
+            enabled: !!v.enabled,
+            name: String(v.name ?? ''),
+            id: String(v.id ?? newId()),
+            content: String(v.content ?? ''),
+            info: String(v.info ?? ''),
+            button: { enabled: true, buttons: Array.isArray(v.buttons) ? v.buttons : [] },
+            data: isPlainObject(v.data) ? v.data : {},
+            export_with: { data: true, button: true },
+        };
+    };
+    return (Array.isArray(list) ? list : []).map(t => (t?.type === 'folder'
+        ? {
+            type: 'folder', enabled: true, name: String(t.name ?? ''), id: String(t.id ?? newId()),
+            icon: typeof t.icon === 'string' ? t.icon : 'fa-solid fa-folder',
+            ...(typeof t.color === 'string' ? { color: t.color } : {}),
+            scripts: (Array.isArray(t.value) ? t.value : []).map(one),
+        }
+        : one(t)));
+}
+
+/**
+ * A card's Tavern Helper settings `{ scripts, variables, ... }`. `legacy` when they are still in the
+ * pre-4.x fields — Tavern Helper moves them only while `tavern_helper` doesn't exist, so a write
+ * then has to carry the variables too.
+ */
+function thSettingsOf(data) {
+    const ext = data?.extensions ?? {};
+    let cur = ext[TH_FIELD];
+    if (Array.isArray(cur)) { try { cur = Object.fromEntries(cur); } catch { cur = null; } }
+    if (isPlainObject(cur)) {
+        return { settings: { ...cur, scripts: Array.isArray(cur.scripts) ? cur.scripts : [], variables: isPlainObject(cur.variables) ? cur.variables : {} }, legacy: false };
+    }
+    if (ext.TavernHelper_scripts !== undefined || ext.TavernHelper_characterScriptVariables !== undefined) {
+        return {
+            settings: { scripts: fromLegacyScripts(ext.TavernHelper_scripts), variables: isPlainObject(ext.TavernHelper_characterScriptVariables) ? ext.TavernHelper_characterScriptVariables : {} },
+            legacy: true,
+        };
+    }
+    return { settings: { scripts: [], variables: {} }, legacy: false };
+}
+
+function isManagedCard(card) {
+    const d = cardData(card);
+    return !!cardManifest(d) || flattenTrees(thSettingsOf(d).settings.scripts).length > 0;
+}
+
+/** The new card's own scripts: the ones its manifest lists, or all of them without a manifest. */
+function incomingScripts(data, m) {
+    const all = flattenTrees(thSettingsOf(data).settings.scripts);
+    return (m ? all.filter(s => m.scripts.includes(String(s.id))) : all)
+        .map(s => ({ ...structuredClone(s), type: 'script', id: String(s.id ?? newId()) }));
+}
+
+function incomingRegex(data, m) {
+    const all = Array.isArray(data?.extensions?.regex_scripts) ? data.extensions.regex_scripts : [];
+    return (m ? all.filter(s => m.regex.includes(String(s?.id))) : all).filter(isPlainObject).map(s => structuredClone(s));
+}
+
+/**
+ * Merge the card's scripts into the player's script trees (folders searched too). Matched by id, or by
+ * name when `byName` (cards without a manifest had random ids); a name match takes the card's id so
+ * the next update matches by id. Unmatched scripts are added at the end; the player's are kept.
+ */
+function mergeScriptTrees(trees, incoming, byName) {
+    const out = structuredClone(Array.isArray(trees) ? trees : []);
+    const all = flattenTrees(out);
+    const used = new Set();
+    const updated = [], added = [], fuzzy = [];
+    for (const inc of incoming) {
+        let hit = all.find(s => !used.has(s) && String(s.id) === String(inc.id));
+        if (!hit && byName) {
+            hit = all.find(s => !used.has(s) && String(s.name ?? '').trim() && sameName(s.name, inc.name));
+            if (hit) fuzzy.push(inc.name);
+        }
+        if (!hit) {
+            const s = structuredClone(inc);
+            out.push(s);
+            used.add(s);
+            added.push(s.name);
+            continue;
+        }
+        used.add(hit);
+        const oldButtons = Array.isArray(hit.button?.buttons) ? hit.button.buttons : [];
+        hit.content = inc.content ?? '';
+        hit.info = inc.info ?? '';
+        hit.name = inc.name ?? hit.name;
+        const buttons = (Array.isArray(inc.button?.buttons) ? inc.button.buttons : []).map(b => {
+            const prev = oldButtons.find(o => o?.name === b?.name);
+            return { ...structuredClone(b), visible: prev ? !!prev.visible : !!b?.visible };
+        });
+        hit.button = { ...(isPlainObject(hit.button) ? hit.button : { enabled: inc.button?.enabled ?? true }), buttons };
+        if (String(hit.id) !== String(inc.id) && !all.some(s => String(s.id) === String(inc.id))) hit.id = inc.id;
+        updated.push(inc.name);
+    }
+    return { trees: out, updated, added, fuzzy, others: all.length - (updated.length), changed: !sameJson(out, trees ?? []) };
+}
+
+/** Same for regex: the listed fields come from the card, `disabled` (and anything else) stays the player's. */
+function mergeCardRegex(list, incoming, byName) {
+    const base = Array.isArray(list) ? list : [];
+    const out = structuredClone(base);
+    const used = new Set();
+    const updated = [], added = [], fuzzy = [];
+    for (const inc of incoming) {
+        let hit = out.find(s => !used.has(s) && s?.id != null && String(s.id) === String(inc.id));
+        if (!hit && byName) {
+            hit = out.find(s => !used.has(s) && regexName(s) && sameName(regexName(s), regexName(inc)));
+            if (hit) fuzzy.push(regexName(inc));
+        }
+        if (!hit) {
+            const s = structuredClone(inc);
+            if (!s.id) s.id = newId();
+            out.push(s);
+            used.add(s);
+            added.push(regexName(s));
+            continue;
+        }
+        used.add(hit);
+        for (const k of REGEX_OVERWRITE) if (k in inc) hit[k] = structuredClone(inc[k]);
+        if (inc.id && String(hit.id) !== String(inc.id) && !out.some(s => String(s?.id) === String(inc.id))) hit.id = inc.id;
+        updated.push(regexName(inc));
+    }
+    return { result: out, updated, added, fuzzy, others: base.length - updated.length, changed: !sameJson(out, base) };
+}
+
+/**
+ * Merge the card's lorebook entries (`incoming`, SillyTavern's format) into a lorebook file. Only the
+ * entries named in `owned` are written: a match by comment is rewritten keeping its uid and on/off,
+ * a new one gets uid max+1. `forceOff` entries are always switched off; `remove` names old card
+ * entries to delete. The player's entries are not touched.
+ */
+function mergeWorldEntries(book, incoming, { owned, forceOff = [], remove = [] }) {
+    const out = structuredClone(book ?? {});
+    if (!isPlainObject(out.entries)) out.entries = {};
+    delete out.originalData; // a copy of the card's book from import time — stale after this
+    const keys = Object.keys(out.entries);
+    let maxUid = keys.reduce((n, k) => Math.max(n, Number.isFinite(Number(out.entries[k]?.uid)) ? Number(out.entries[k].uid) : (Number(k) || 0)), -1);
+    const ownedSet = new Set(owned), offSet = new Set(forceOff), removeSet = new Set(remove);
+    const used = new Set();
+    const updated = [], added = [], removed = [], forced = [];
+    for (const inc of Object.values(incoming?.entries ?? {})) {
+        const name = entryName(inc);
+        if (!name || !ownedSet.has(name)) continue;
+        const key = keys.find(k => !used.has(k) && entryName(out.entries[k]) === name);
+        const entry = structuredClone(inc);
+        if (key !== undefined) {
+            const prev = out.entries[key];
+            entry.uid = prev?.uid ?? Number(key);
+            entry.disable = !!prev?.disable;
+            out.entries[key] = entry;
+            used.add(key);
+            updated.push(name);
+        } else {
+            entry.uid = ++maxUid;
+            out.entries[entry.uid] = entry;
+            used.add(String(entry.uid));
+            added.push(name);
+        }
+    }
+    for (const k of Object.keys(out.entries)) {
+        const e = out.entries[k];
+        const name = entryName(e);
+        if (removeSet.has(name) && !used.has(k)) { delete out.entries[k]; removed.push(name); continue; }
+        if (offSet.has(name) && !e.disable) { e.disable = true; forced.push(name); }
+    }
+    const mine = Object.values(out.entries).filter(e => !ownedSet.has(entryName(e))).length;
+    return { book: out, updated, added, removed, forced, playerEntries: mine };
+}
+
+/** The new card's embedded lorebook with the always-off entries switched off, or null. */
+function embeddedBook(data, forceOff) {
+    const book = data?.character_book;
+    if (!book || !Array.isArray(book.entries)) return null;
+    const b = structuredClone(book);
+    for (const e of b.entries) if (forceOff.includes(entryName(e))) e.enabled = false;
+    return b;
+}
+
+/** Merge like the server's deepMerge: objects key by key, anything else (arrays too) replaced. */
+function deepAssign(target, patch) {
+    for (const [k, v] of Object.entries(patch)) {
+        if (isPlainObject(v) && isPlainObject(target[k])) deepAssign(target[k], v);
+        else target[k] = structuredClone(v);
+    }
+    return target;
+}
+
+/** Write `patch` into the card file (/merge-attributes) and into the copy in memory. Throws on failure. */
+async function mergeCard(chid, patch) {
+    const c = ctx();
+    const ch = c.characters[chid];
+    if (!ch) throw new Error('หาตัวละครไม่เจอ');
+    const res = await fetch('/api/characters/merge-attributes', {
+        method: 'POST',
+        headers: c.getRequestHeaders(),
+        body: JSON.stringify({ avatar: ch.avatar, ...patch }),
+    });
+    if (!res.ok) {
+        const why = await res.json().then(j => j?.error || j?.message).catch(() => '');
+        throw new Error(`บันทึกการ์ดไม่สำเร็จ (${res.status}${why ? `: ${why}` : ''})`);
+    }
+    patchInMemory(chid, patch);
+}
+
+function patchInMemory(chid, patch) {
+    const c = ctx();
+    const ch = c.characters[chid];
+    if (!ch) return;
+    deepAssign(ch, patch);
+    if (ch.json_data) {
+        try {
+            ch.json_data = JSON.stringify(deepAssign(JSON.parse(ch.json_data), patch));
+            if (String(chid) === String(c.characterId)) $('#character_json_data').val(ch.json_data);
+        } catch (e) {
+            console.warn(LOG, 'could not update json_data', e);
+        }
+    }
+}
+
+/** Put the new card's picture on the character; the server keeps the character's data. */
+async function replaceAvatarImage(file, avatar) {
+    const c = ctx();
+    const form = new FormData();
+    form.append('avatar', file);
+    form.append('avatar_url', avatar);
+    const res = await fetch('/api/characters/edit-avatar', {
+        method: 'POST',
+        headers: c.getRequestHeaders({ omitContentType: true }),
+        body: form,
+        cache: 'no-cache',
+    });
+    if (!res.ok) throw new Error(`เปลี่ยนรูปตัวละครไม่สำเร็จ (${res.status})`);
+}
+
+async function waitFor(test, ms) {
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+        if (test()) return true;
+        await new Promise(r => setTimeout(r, 50));
+    }
+    return test();
+}
+
+const hasTavernHelper = () => typeof globalThis.TavernHelper?.updateScriptTreesWith === 'function';
+
+/**
+ * Which character a Tavern Helper card updates: the ones whose manifest has the same bot_id, or
+ * (without a manifest) the same name; the open character too unless its bot_id differs.
+ * Asks when there is more than one. Returns a chid, or undefined (message already shown).
+ */
+async function pickManagedTarget(next, newM, old) {
+    const c = ctx();
+    const botId = newM?.botId ?? '';
+    const found = [];
+    for (let i = 0; i < ctx().characters.length; i++) {
+        let ch = ctx().characters[i];
+        if (!ch?.avatar) continue;
+        const isOpen = !!old && String(old.chid) === String(i);
+        const nameHit = sameName(ch.name, next.name);
+        if (ch.shallow && !isOpen && !nameHit) continue; // shallow characters carry no manifest
+        if (ch.shallow) { await c.unshallowCharacter?.(i); ch = ctx().characters[i]; }
+        const m = cardManifest(ch.data);
+        if (botId && m?.botId) { if (m.botId === botId) found.push({ chid: i, by: 'id' }); }
+        else if (nameHit) found.push({ chid: i, by: 'name' });
+    }
+    const openM = old ? cardManifest(ctx().characters[old.chid]?.data) : null;
+    const openConflict = !!(botId && openM?.botId && openM.botId !== botId);
+    const options = [...found];
+    if (old && !openConflict && !options.some(o => String(o.chid) === String(old.chid))) options.unshift({ chid: Number(old.chid), by: 'open' });
+    if (!options.length) {
+        await c.Popup.show.text('อัปเดตไม่ได้', openConflict
+            ? `การ์ดนี้เป็นของบอท <code>${esc(botId)}</code> แต่ตัวละครที่เปิดอยู่เป็นของ <code>${esc(openM.botId)}</code> — ไม่อัปเดต`
+            : `ไม่พบตัวละคร “${esc(next.name)}” ที่จะอัปเดต — เปิดตัวละครนั้นก่อนแล้วลองใหม่`);
+        return undefined;
+    }
+    if (options.length === 1) return options[0].chid;
+
+    const isOpen = o => !!old && String(o.chid) === String(old.chid);
+    const el = document.createElement('div');
+    el.className = 'cu_dialog';
+    el.innerHTML = `<h3>อัปเดตตัวละครไหน?</h3>
+        <div class="cu_note">พบตัวละครที่ตรงกับการ์ด “${esc(next.name)}” ${options.length} ตัว</div>
+        <select class="text_pole cu_pick">${options.map(o => {
+            const ch = ctx().characters[o.chid];
+            const tag = [isOpen(o) ? 'เปิดอยู่' : '', o.by === 'id' ? '' : 'จับคู่ด้วยชื่อ'].filter(Boolean).join(' · ');
+            return `<option value="${o.chid}">${esc(ch.name)} (${esc(ch.avatar)})${tag ? ` — ${tag}` : ''}</option>`;
+        }).join('')}</select>`;
+    const pick = el.querySelector('.cu_pick');
+    pick.value = String((options.find(isOpen) ?? options[0]).chid);
+    let chosen;
+    await new c.Popup(el, c.POPUP_TYPE.CONFIRM, '', {
+        okButton: 'ต่อไป',
+        cancelButton: 'ยกเลิก',
+        onClosing: p => { if (p.result === c.POPUP_RESULT.AFFIRMATIVE) chosen = Number(pick.value); return true; },
+    }).show();
+    return chosen;
+}
+
+/** Everything the dialog shows, worked out against the character's current state. */
+async function managedPreview(chid, item) {
+    const c = ctx();
+    await c.unshallowCharacter?.(chid);
+    const ch = ctx().characters[chid];
+    const nd = cardData(item.card), od = ch.data ?? {};
+    const newM = cardManifest(nd), oldM = cardManifest(od);
+    const byName = !oldM || !newM;
+    const scriptsIn = incomingScripts(nd, newM);
+    const regexIn = incomingRegex(nd, newM);
+    const owned = newM ? newM.owned : (nd.character_book?.entries ?? []).map(entryName).filter(Boolean);
+    const forceOff = newM?.forceOff ?? [];
+    const book = embeddedBook(nd, forceOff);
+    const worldName = String(od.extensions?.world ?? '').trim();
+    const world = worldName && worldNames().includes(worldName) ? worldName : '';
+    let lore = null, stale = [];
+    if (world && book) {
+        const cur = await loadWorld(world);
+        if (cur) {
+            const names = Object.values(cur.entries ?? {}).map(entryName);
+            stale = oldM && newM ? [...new Set(oldM.owned.filter(n => !newM.owned.includes(n) && names.includes(n)))] : [];
+            lore = mergeWorldEntries(cur, c.convertCharacterBook(structuredClone(book)), { owned, forceOff });
+        }
+    }
+    const isCurrent = String(chid) === String(c.characterId) && !c.groupId;
+    return {
+        chid, avatar: ch.avatar, name: ch.name, chat: ch.chat, isCurrent,
+        newM, oldM, byName, scriptsIn, regexIn, owned, forceOff, book, world, worldName, lore, stale,
+        scripts: mergeScriptTrees(thSettingsOf(od).settings.scripts, scriptsIn, byName),
+        regex: mergeCardRegex(od.extensions?.regex_scripts, regexIn, byName),
+        fields: CARD_DATA_FIELDS.filter(k => k in nd && !sameJson(nd[k], od[k])),
+        allowed: isRegexAllowed(ch.avatar),
+        hasTH: hasTavernHelper(),
+        versions: { old: oldM?.version || String(od.character_version ?? ''), new: newM?.version || String(nd.character_version ?? '') },
+    };
+}
+
+function mergeText(m, what) {
+    const parts = [];
+    if (m.updated.length) parts.push(`อัปเดต ${m.updated.length}: ${listNames(m.updated, 4)}`);
+    if (m.added.length) parts.push(`เพิ่มใหม่ ${m.added.length}: ${listNames(m.added, 4)}`);
+    if (m.others > 0) parts.push(`${what}อื่นของผู้เล่น ${m.others} ตัวไม่แตะ`);
+    return parts.join('<br>') || 'ไม่มีอะไรเปลี่ยน';
+}
+
+function managedDialog(p, item) {
+    const s = settings();
+    const el = document.createElement('div');
+    el.className = 'cu_dialog';
+    const next = cardInfo(item.card);
+    const v = p.versions;
+    const warn = html => `<div class="cu_warn"><i class="fa-solid fa-triangle-exclamation"></i> ${html}</div>`;
+
+    const loreNote = !p.book ? 'การ์ดใหม่ไม่มี lorebook ฝังมา — ไม่แตะ lorebook'
+        : `ชุดที่ฝังในการ์ด: <b>${p.book.entries.length}</b> ${plural(p.book.entries.length)} (เขียนทับทั้งชุด)<br>`
+        + (p.lore ? `ไฟล์ “${esc(p.world)}” ที่ผูกไว้: ${[
+            p.lore.updated.length ? `อัปเดต ${p.lore.updated.length}` : '',
+            p.lore.added.length ? `เพิ่มใหม่ ${p.lore.added.length}` : '',
+            `entry ของผู้เล่น ${p.lore.playerEntries} ไม่แตะ`,
+        ].filter(Boolean).join(' · ')}<br><small>entry เดิมคง uid และการเปิด/ปิดของผู้เล่นไว้</small>`
+            : p.worldName ? `ไฟล์ “${esc(p.worldName)}” ที่ผูกไว้ไม่มีอยู่ — ใช้ชุดที่ฝังในการ์ด`
+                : 'ไม่ได้ผูกไฟล์ lorebook — ใช้ชุดที่ฝังในการ์ด');
+
+    el.innerHTML = `
+        <h3>อัปเดตการ์ด: ${esc(p.name)}</h3>
+        <div class="cu_row"><i class="fa-solid fa-id-card"></i> <span><b>${esc(item.file.name)}</b> → <code>${esc(p.avatar)}</code>${p.isCurrent ? '' : ' <small>(ไม่ได้เปิดอยู่)</small>'}<br>
+            <small>${v.old || v.new ? `v${esc(v.old || '?')} → <b>v${esc(v.new || '?')}</b> · ` : ''}อัปเดตทีละส่วน: ความคืบหน้าในแชท ตัวแปร และค่าที่ผู้เล่นตั้งไว้คงเดิม</small></span></div>
+        ${next.name && !sameName(next.name, p.name) ? warn(`ชื่อในไฟล์คือ “${esc(next.name)}” ไม่ตรงกับ “${esc(p.name)}” — เลือกไฟล์ถูกหรือเปล่า?`) : ''}
+        ${p.byName ? warn('การ์ดเดิมไม่มีข้อมูลสำหรับอัปเดต (manifest) — จับคู่สคริปต์และ regex <b>ด้วยชื่อ</b> ซึ่งอาจไม่แม่นยำ ตรวจดูหลังอัปเดต') : ''}
+        <div class="cu_section">
+            <div class="cu_head"><i class="fa-solid fa-scroll"></i> สคริปต์ Tavern Helper</div>
+            <div class="cu_note">${mergeText(p.scripts, 'สคริปต์')}<br><small>เปิด/ปิด ตัวแปรของสคริปต์ และการแสดงปุ่มคงเดิม</small></div>
+            ${p.hasTH ? '' : warn('ไม่พบ Tavern Helper (JS-Slash-Runner) — อัปเดตได้ แต่ต้องติดตั้งก่อนบอทถึงจะทำงาน')}
+        </div>
+        <div class="cu_section">
+            <div class="cu_head"><i class="fa-solid fa-code"></i> Regex ของการ์ด</div>
+            <div class="cu_note">${mergeText(p.regex, 'regex ')}<br><small>เปิด/ปิดคงเดิม</small></div>
+            ${p.regex.result.length && !p.allowed ? warn('regex ของการ์ดนี้<b>ยังไม่ได้รับอนุญาต</b>ให้ทำงาน (อนุญาตเองได้ที่ Extensions → Regex)') : ''}
+        </div>
+        <div class="cu_section">
+            <div class="cu_head"><i class="fa-solid fa-book-atlas"></i> Lorebook</div>
+            <div class="cu_note">${loreNote}</div>
+            ${p.lore?.forced.length ? `<div class="cu_note">ปิดกลับ (ต้องปิดไว้เสมอ): ${listNames(p.lore.forced)}</div>` : ''}
+            ${p.stale.length ? `<div class="cu_note">entry ของการ์ดเดิมที่การ์ดใหม่ไม่มีแล้ว — ติ๊กตัวที่จะลบ:</div>
+                ${p.stale.map((n, i) => `<label class="checkbox_label"><input type="checkbox" class="cu_stale_entry" data-i="${i}"> ${esc(n)}</label>`).join('')}` : ''}
+        </div>
+        <div class="cu_section">
+            <div class="cu_head"><i class="fa-solid fa-address-card"></i> ข้อมูลการ์ด</div>
+            <div class="cu_note">${p.fields.length ? `เปลี่ยน: ${p.fields.map(f => `<code>${f}</code>`).join(', ')}` : 'ไม่มีอะไรเปลี่ยน'}${p.fields.includes('first_mes') ? '<br><small>ข้อความทักทายในแชทที่เล่นอยู่แล้วไม่เปลี่ยน</small>' : ''}</div>
+            ${item.ext === 'png' ? '<label class="checkbox_label"><input type="checkbox" class="cu_card_image"> ใช้รูปจากการ์ดใหม่</label>' : '<div class="cu_note">รูปตัวละครคงเดิม</div>'}
+        </div>
+        <div class="cu_note">กด “ย้อนกลับ” ในหน้าสรุปได้ ถ้าเลือกผิดไฟล์</div>`;
+
+    const img = el.querySelector('.cu_card_image');
+    if (img) img.checked = s.useCardImage;
+    const read = () => ({
+        useImage: !!img?.checked,
+        removeEntries: [...el.querySelectorAll('.cu_stale_entry')].filter(x => x.checked).map(x => p.stale[Number(x.dataset.i)]),
+    });
+    return { el, read, showsImage: !!img };
+}
+
+async function askManagedPlan(p, item) {
+    const c = ctx();
+    const { el, read, showsImage } = managedDialog(p, item);
+    let plan = null;
+    await new c.Popup(el, c.POPUP_TYPE.CONFIRM, '', {
+        okButton: 'อัปเดต',
+        cancelButton: 'ยกเลิก',
+        allowVerticalScrolling: true,
+        onClosing: pp => { if (pp.result === c.POPUP_RESULT.AFFIRMATIVE) plan = read(); return true; },
+    }).show();
+    if (plan && showsImage) { settings().useCardImage = plan.useImage; save(); }
+    return plan;
+}
+
+async function runManagedUpdate(item, p, plan) {
+    const c = ctx();
+    const TH = globalThis.TavernHelper;
+    const { chid, avatar } = p;
+    const idsOf = trees => flattenTrees(trees).map(x => String(x.id)).sort();
+    // Tavern Helper's copy must be this character's (it follows the open chat).
+    const viaTH = p.isCurrent && hasTavernHelper()
+        && sameJson(idsOf(TH.getScriptTrees({ type: 'character' })), idsOf(thSettingsOf(ctx().characters[chid]?.data).settings.scripts));
+    const report = [];
+    const undo = {
+        avatar,
+        chat: p.chat,
+        show: p.isCurrent,
+        png: await fetchAvatarPng(avatar),
+        cardTouched: false,
+        world: null,
+        loreFlag: null,
+        globalRegex: null,
+        allowed: null,
+        thTrees: viaTH ? TH.getScriptTrees({ type: 'character' }) : null,
+    };
+    if (!undo.png) throw new Error('อ่านการ์ดเดิมจากเซิร์ฟเวอร์ไม่ได้ (ใช้ย้อนกลับ) — ยังไม่ได้แก้อะไร');
+    const nd = cardData(item.card);
+    const ch = () => ctx().characters[chid];
+    if (ch()?.avatar !== avatar) throw new Error('รายชื่อตัวละครเปลี่ยนไประหว่างนั้น — ยังไม่ได้แก้อะไร');
+    await c.unshallowCharacter?.(chid);
+    let sm;
+    let reloadHint = false;
+    let failed = false;
+    try {
+        // 1. picture (the server keeps the card data as it is)
+        if (plan.useImage && item.ext === 'png') {
+            await replaceAvatarImage(item.file, avatar);
+            undo.cardTouched = true;
+            await refreshImages(avatar);
+            report.push(line('ok', 'ใช้รูปจากการ์ดใหม่'));
+        }
+
+        // 2. card fields and the embedded lorebook
+        const patch = { data: {} };
+        for (const k of CARD_V1_FIELDS) if (k in nd) patch[k] = nd[k];
+        for (const k of CARD_DATA_FIELDS) if (k in nd) patch.data[k] = nd[k];
+        if ('creator_notes' in nd) patch.creatorcomment = nd.creator_notes;
+        if (p.book) patch.data.character_book = p.book;
+        undo.cardTouched = true;
+        await mergeCard(chid, patch);
+        report.push(line('ok', p.fields.length ? `ข้อมูลการ์ด: เปลี่ยน ${p.fields.map(f => `<code>${f}</code>`).join(', ')}` : 'ข้อมูลการ์ดเหมือนเดิม'));
+
+        // 3. regex — the regex engine reads the card live, so this works open or not
+        const rx = mergeCardRegex(ch().data?.extensions?.regex_scripts, p.regexIn, p.byName);
+        if (rx.changed) await mergeCard(chid, { data: { extensions: { regex_scripts: rx.result } } });
+        if (p.regexIn.length) {
+            const off = rx.result.filter(x => x?.disabled).length;
+            report.push(line('ok', `Regex ของการ์ด: ${regexReportText({ replaced: rx.updated, added: rx.added, removed: [], kept: rx.others })}${off ? ` · ปิดไว้ ${off}` : ''}`));
+            if (rx.fuzzy.length) report.push(line('warn', `regex ที่จับคู่ด้วยชื่อ: ${listNames(rx.fuzzy)}`));
+            if (!isRegexAllowed(avatar)) report.push(line('warn', 'regex ของการ์ดนี้<b>ยังไม่ได้รับอนุญาต</b>ให้ทำงาน (อนุญาตเองได้ที่ Extensions → Regex)'));
+        }
+
+        // 4. the linked lorebook file — SillyTavern reads it before the embedded copy
+        if (p.book && p.world) {
+            const before = await loadWorld(p.world);
+            if (before) {
+                const w = mergeWorldEntries(before, c.convertCharacterBook(structuredClone(p.book)), { owned: p.owned, forceOff: p.forceOff, remove: plan.removeEntries });
+                undo.world = { name: p.world, data: before, existed: true };
+                await c.saveWorldInfo(p.world, w.book, true);
+                await c.updateWorldInfoList();
+                c.reloadWorldInfoEditor?.(p.world);
+                const parts = [];
+                if (w.updated.length) parts.push(`อัปเดต ${w.updated.length}`);
+                if (w.added.length) parts.push(`เพิ่มใหม่ ${w.added.length}: ${listNames(w.added, 4)}`);
+                if (w.removed.length) parts.push(`ลบ ${w.removed.length}: ${listNames(w.removed, 4)}`);
+                parts.push(`entry ของผู้เล่น ${w.playerEntries} ไม่แตะ`);
+                report.push(line('ok', `Lorebook “${esc(p.world)}”: ${parts.join(' · ')}`));
+                if (w.forced.length) report.push(line('info', `ปิด entry ที่ต้องปิดไว้เสมอ: ${listNames(w.forced)}`));
+            } else {
+                report.push(line('warn', `เปิด lorebook “${esc(p.world)}” ไม่ได้ — อัปเดตแค่ชุดที่ฝังในการ์ด`));
+            }
+        } else if (p.book) {
+            report.push(line('info', `ไม่ได้ผูกไฟล์ lorebook · อัปเดตชุดที่ฝังในการ์ด (${p.book.entries.length} ${plural(p.book.entries.length)})`));
+        }
+
+        // 5. scripts, then the manifest as the "done" mark
+        const manifestPatch = p.newM ? { data: { extensions: { card_updater: structuredClone(p.newM.raw) } } } : null;
+        if (viaTH) {
+            // Tavern Helper keeps the open card in memory and writes the whole card back when its scripts
+            // change, so its save carries the manifest too — no second write racing with it.
+            const oldManifest = ch().data?.extensions?.card_updater;
+            if (manifestPatch) patchInMemory(chid, manifestPatch);
+            const before = TH.getScriptTrees({ type: 'character' });
+            try {
+                await TH.updateScriptTreesWith(trees => (sm = mergeScriptTrees(trees, p.scriptsIn, p.byName)).trees, { type: 'character' });
+            } catch (e) {
+                if (manifestPatch) {
+                    const ext = ch().data.extensions;
+                    if (oldManifest === undefined) delete ext.card_updater; else ext.card_updater = oldManifest;
+                    if (ch().json_data) { const j = JSON.parse(ch().json_data); if (oldManifest === undefined) delete j.data.extensions.card_updater; else j.data.extensions.card_updater = oldManifest; ch().json_data = JSON.stringify(j); }
+                }
+                throw new Error(`Tavern Helper ไม่รับสคริปต์ใหม่: ${e.message}`);
+            }
+            const after = TH.getScriptTrees({ type: 'character' });
+            const saving = !sameJson(before, after);
+            const saved = saving && await waitFor(() => sameJson(ch()?.data?.extensions?.[TH_FIELD]?.scripts, after), 5000);
+            if (!saving) {
+                if (manifestPatch) await mergeCard(chid, manifestPatch);
+            } else if (!saved) {
+                // Tavern Helper didn't pick it up — write the card ourselves; a page refresh settles its memory.
+                await mergeCard(chid, { data: { extensions: { [TH_FIELD]: { scripts: after }, ...(manifestPatch?.data.extensions ?? {}) } } });
+                reloadHint = true;
+            }
+        } else {
+            const cur = thSettingsOf(ch().data);
+            sm = mergeScriptTrees(cur.settings.scripts, p.scriptsIn, p.byName);
+            if (sm.changed || cur.legacy) {
+                await mergeCard(chid, { data: { extensions: { [TH_FIELD]: cur.legacy ? { scripts: sm.trees, variables: cur.settings.variables } : { scripts: sm.trees } } } });
+                if (p.isCurrent && hasTavernHelper()) reloadHint = true;
+            }
+            if (manifestPatch) await mergeCard(chid, manifestPatch);
+        }
+    } catch (e) {
+        console.error(LOG, e);
+        failed = true;
+        report.push(line('warn', `<b>หยุดกลางทาง:</b> ${esc(e.message)}<br>ส่วนที่เหลือยังไม่ได้อัปเดต — กด “ย้อนกลับ” เพื่อคืนของเดิม แล้วลองใหม่`));
+    }
+    if (!failed && p.scriptsIn.length) {
+        report.push(line('ok', `สคริปต์ Tavern Helper: ${regexReportText({ replaced: sm.updated, added: sm.added, removed: [], kept: sm.others })}`));
+        if (sm.fuzzy.length) report.push(line('warn', `สคริปต์ที่จับคู่ด้วยชื่อ: ${listNames(sm.fuzzy)}`));
+        if (!p.hasTH) report.push(line('warn', 'ยังไม่ได้ติดตั้ง <b>Tavern Helper (JS-Slash-Runner)</b> — ต้องติดตั้งก่อนบอทถึงจะทำงาน'));
+        else if (!p.isCurrent) report.push(line('info', 'สคริปต์ใหม่จะทำงานเมื่อเปิดตัวละครนี้ครั้งถัดไป'));
+    }
+    if (!failed && p.byName) report.push(line('warn', 'การ์ดเดิมไม่มี manifest — จับคู่ด้วยชื่อ ตรวจดูสคริปต์และ regex ว่าไม่ซ้ำ'));
+    report.push(line('info', 'ความคืบหน้าในแชทและตัวแปรของผู้เล่นไม่ถูกแตะ'));
+    if (reloadHint) report.push(line('warn', 'เขียนสคริปต์ลงการ์ดโดยตรงขณะการ์ดเปิดอยู่ — <b>รีเฟรชหน้า</b>ก่อนเล่นต่อ'));
+
+    // The character editor shows the old text; refresh it so its autosave can't write that back.
+    if (p.isCurrent) {
+        try { await ctx().selectCharacterById(chid, { switchMenu: false }); } catch (e) { console.warn(LOG, 'could not refresh the editor', e); }
+    }
+    const version = p.newM?.version || String(nd.character_version ?? '');
+    return {
+        report, undo,
+        title: failed ? 'อัปเดตไม่ครบ' : null,
+        doneToast: !failed && p.isCurrent && !reloadHint ? `อัปเดต${version ? `เป็น v${version}` : ''}แล้ว` : null,
+    };
+}
+
+async function updateManagedCard(item, old) {
+    const c = ctx();
+    const next = cardInfo(item.card);
+    const newM = cardManifest(cardData(item.card));
+    const chid = await pickManagedTarget(next, newM, old);
+    if (chid === undefined) return;
+    const p = await managedPreview(chid, item);
+    if (p.newM?.botId && p.oldM?.botId && p.newM.botId !== p.oldM.botId) {
+        await c.Popup.show.text('อัปเดตไม่ได้', `การ์ดนี้เป็นของบอท <code>${esc(p.newM.botId)}</code> แต่ “${esc(p.name)}” เป็นของ <code>${esc(p.oldM.botId)}</code>`);
+        return;
+    }
+    const v = p.versions;
+    if (v.old && v.new && compareVersions(v.new, v.old) <= 0) {
+        const ok = await c.Popup.show.confirm('เวอร์ชันไม่ได้ใหม่กว่า',
+            `ไฟล์เป็น <b>v${esc(v.new)}</b> แต่ “${esc(p.name)}” เป็น <b>v${esc(v.old)}</b> อยู่แล้ว — อัปเดตต่อไหม?`);
+        if (ok !== c.POPUP_RESULT.AFFIRMATIVE) return;
+    }
+    const plan = await askManagedPlan(p, item);
+    if (!plan) return;
+    if (isGenerating() || ctx().characters[chid]?.avatar !== p.avatar || (p.isCurrent && String(ctx().characterId) !== String(chid))) {
+        toast.warn('ตัวละครเปลี่ยนไป หรือบอทกำลังตอบ — ยกเลิกการอัปเดต');
+        return;
+    }
+    const result = await withLoader(() => runManagedUpdate(item, p, plan));
+    busy = false;
+    if (result.doneToast) toast.ok(result.doneToast);
+    await showReport(result);
 }
 
 // ---------------------------------------------------------------- entry point
@@ -994,6 +1651,14 @@ async function onFilesPicked(files) {
             return;
         }
         const old = await currentCharacter();
+        if (items.card?.card && isManagedCard(items.card.card)) {
+            if (items.lore || items.regex) {
+                await c.Popup.show.text('อัปเดตไม่ได้', 'การ์ดนี้มีสคริปต์ Tavern Helper — เลือกไฟล์การ์ดไฟล์เดียว (lorebook และ regex อยู่ในการ์ดแล้ว)');
+                return;
+            }
+            await updateManagedCard(items.card, old);
+            return;
+        }
         if (items.card && !old) { toast.warn('เปิดตัวละครที่จะอัปเดตการ์ดก่อน (ใช้กับแชทกลุ่มไม่ได้)'); return; }
 
         const plan = await askPlan(items, old);
@@ -1063,6 +1728,7 @@ function addSettings() {
                 <label class="checkbox_label"><input type="checkbox" data-key="updateLore"> การ์ด: เขียน lorebook ที่ฝังมาทับของเดิม</label>
                 <label class="checkbox_label"><input type="checkbox" data-key="allowRegex"> อนุญาต regex ของการ์ดอัตโนมัติ</label>
                 <label class="checkbox_label"><input type="checkbox" data-key="keepAvatar"> การ์ด .json ใช้รูปตัวละครเดิม</label>
+                <label class="checkbox_label"><input type="checkbox" data-key="useCardImage"> การ์ดที่มีสคริปต์ Tavern Helper (.png): ใช้รูปจากการ์ดใหม่</label>
                 <label class="cu_field">การ์ดใหม่: regex เดิมที่ไม่อยู่ในการ์ด
                     <select class="text_pole" data-key="cardRegexMode">
                         <option value="merge">คงไว้</option>
@@ -1138,6 +1804,7 @@ async function reloadWithFreshFiles() {
     }
 }
 
-globalThis.CardUpdater = { VERSION, checkForNewVersion, reloadWithFreshFiles, readPngCard, writePngCard, cardInfo, jsonKind, loreDiff, mergeRegex, cardRegexAfter, onFilesPicked };
+globalThis.CardUpdater = { VERSION, checkForNewVersion, reloadWithFreshFiles, readPngCard, writePngCard, cardInfo, jsonKind, loreDiff, mergeRegex, cardRegexAfter, onFilesPicked,
+    cardManifest, compareVersions, isManagedCard, thSettingsOf, mergeScriptTrees, mergeCardRegex, mergeWorldEntries };
 
 if (typeof jQuery === 'function') jQuery(init); else init();
