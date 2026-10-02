@@ -4,9 +4,11 @@
  * One button in the character panel. Pick one or more files — it tells what each one is:
  *   • a character card  → replaces the open character but keeps its file name, so every
  *     chat stays linked; the lorebook embedded in the card overwrites the linked one
- *     (same name, no version bumps); the card's regex is allowed, and the old scripts the new
+ *     (same name), or — if asked — goes into a new lorebook with the version in its name,
+ *     linked instead, the old one left as it was; the card's regex is allowed, and the old scripts the new
  *     card doesn't have are kept (unless asked to drop them); a .json keeps the avatar;
- *   • a lorebook (.json) → overwrites the lorebook linked to the character (or any you name);
+ *   • a lorebook (.json) → overwrites the lorebook linked to the character (or any you name),
+ *     or becomes a new versioned lorebook next to it;
  *   • regex (.json, one script or a list) → replaces the scripts with the same names and adds
  *     new ones, in the character's regex or the global list.
  *   • a card with Tavern Helper (JS-Slash-Runner) scripts or a `card_updater` manifest → updated
@@ -19,12 +21,13 @@
 
 const MODULE = 'card_updater';
 const LOG = '[CardUpdater]';
-const VERSION = '1.3.0'; // keep in sync with manifest.json
+const VERSION = '1.4.0'; // keep in sync with manifest.json
 const BASE_URL = new URL('.', import.meta.url);
 const CARD_EXT = ['png', 'json', 'charx', 'yaml', 'yml', 'byaf'];
 
 const DEFAULTS = Object.freeze({
     updateLore: true,
+    loreMode: 'overwrite',     // 'overwrite' the lorebook | 'new' one next to it, version in the name
     allowRegex: true,
     keepAvatar: true,
     regexMode: 'merge',        // regex file: 'merge' | 'replace'
@@ -46,6 +49,7 @@ function settings() {
     }
     if (!['merge', 'replace'].includes(s.regexMode)) s.regexMode = 'merge';
     if (!['merge', 'replace'].includes(s.cardRegexMode)) s.cardRegexMode = 'merge';
+    if (!['overwrite', 'new'].includes(s.loreMode)) s.loreMode = 'overwrite';
     return s;
 }
 
@@ -58,6 +62,7 @@ const toast = {
     err: m => globalThis.toastr?.error(m, 'Card Updater'),
 };
 
+const escRe = s => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const sameName = (a, b) => String(a ?? '').trim().toLowerCase() === String(b ?? '').trim().toLowerCase();
 const plural = n => (n === 1 ? 'entry' : 'entries');
@@ -91,6 +96,42 @@ async function loadWorld(name) {
     }
 }
 
+// ---------------------------------------------------------------- versioned lorebook names
+
+/** A lorebook name without its version tail: "Kim's Lorebook v0.5.1 (2)" → "Kim's Lorebook". */
+function loreBaseName(name) {
+    const n = String(name ?? '').trim();
+    return n.replace(/\s*\(\d+\)$/, '').replace(/[\s_-]*v\d+(?:\.\d+)*$/i, '').trim() || n;
+}
+
+/** The version at the end of a file name ("book_v0.5.2.json" → "0.5.2"), or ''. */
+function versionFromFileName(name) {
+    const b = baseName(name);
+    return b.match(/v(\d+(?:\.\d+)*)$/i)?.[1] ?? b.match(/(\d+(?:\.\d+)+)$/)?.[1] ?? '';
+}
+
+/**
+ * A name for a new lorebook next to `current`: "<base> v<version>", or without a version the next
+ * "<base> v<n>" after the ones that exist ("<base>" itself counts as v1). Never one in `taken`:
+ * "(2)", "(3)"… are added when it would be.
+ */
+function versionedLoreName(current, version, taken = worldNames()) {
+    const base = loreBaseName(current);
+    const v = String(version ?? '').trim().replace(/^v/i, '');
+    let name;
+    if (v) {
+        name = `${base} v${v}`;
+    } else {
+        const re = new RegExp(`^${escRe(base)}[\\s_-]*v(\\d+)$`, 'i');
+        name = `${base} v${Math.max(1, ...taken.map(t => Number(String(t).match(re)?.[1] ?? 0))) + 1}`;
+    }
+    const used = new Set(taken);
+    if (!used.has(name)) return name;
+    let i = 2;
+    while (used.has(`${name} (${i})`)) i++;
+    return `${name} (${i})`;
+}
+
 /** What a card holds that we care about. Accepts a V2/V3 card, a V1 card, or `{ data: character.data }`. */
 function cardInfo(card) {
     const d = card?.data && typeof card.data === 'object' ? card.data : (card ?? {});
@@ -102,6 +143,7 @@ function cardInfo(card) {
         entries: book ? book.entries.length : 0,
         bookName: String(book?.name ?? '').trim(),
         world: String(d.extensions?.world ?? '').trim(),
+        version: String(d.extensions?.card_updater?.version || d.character_version || '').trim(),
         regex,
     };
 }
@@ -425,6 +467,9 @@ function planDialog(items, old) {
     const loreRelevant = loreFromFile || (card && (!next || cardHasBook));
     const newLoreData = loreFromFile ? items.lore.data : cardHasBook ? c.convertCharacterBook(next.book) : null;
     const defaultTarget = (hasChar && old.world) || (loreFromFile ? items.lore.name : next?.bookName) || (hasChar ? `${old.name}'s Lorebook` : '');
+    // 'new' mode: a lorebook next to the current one, named with the version (the file's, else the card's).
+    const loreVersion = (loreFromFile ? versionFromFileName(items.lore.file.name) : '') || next?.version || '';
+    const newTarget = defaultTarget ? versionedLoreName(defaultTarget, loreVersion, names) : '';
 
     // --- regex source
     const regexFromFile = !!items.regex;
@@ -462,7 +507,11 @@ function planDialog(items, old) {
         <div class="cu_section">
             <div class="cu_head"><i class="fa-solid fa-book-atlas"></i> Lorebook</div>
             <div class="cu_note">${loreSource}</div>
-            <label class="checkbox_label"><input type="checkbox" class="cu_lore"> เขียนทับ lorebook ชื่อ:</label>
+            <label class="checkbox_label"><input type="checkbox" class="cu_lore"> อัปเดต lorebook</label>
+            <select class="text_pole cu_lore_mode">
+                <option value="overwrite">เขียนทับเล่มเดิม</option>
+                <option value="new">สร้างเล่มใหม่ มีเลขเวอร์ชัน (เก็บเล่มเดิมไว้)</option>
+            </select>
             <input type="text" class="text_pole cu_target" list="cu_world_list" value="${esc(defaultTarget)}" enterkeyhint="done" placeholder="ชื่อ lorebook">
             <datalist id="cu_world_list">${names.map(n => `<option value="${esc(n)}"></option>`).join('')}</datalist>
             <div class="cu_note cu_target_hint"></div>
@@ -524,25 +573,35 @@ function planDialog(items, old) {
     let staleDefaultOff = false;
     let linkTouched = false;
     let diffToken = 0;
+    // The name box remembers what was typed for each mode.
+    const typed = { overwrite: defaultTarget, new: newTarget };
+    let mode = s.loreMode;
     const loreHint = async () => {
         if (!has('.cu_lore')) return;
         const lore = $('.cu_lore'), input = $('.cu_target');
         const name = input.value.trim();
         const exists = names.includes(name);
+        const asNew = mode === 'new';
+        const keep = asNew && names.includes(defaultTarget) && name !== defaultTarget ? defaultTarget : '';
         input.disabled = !lore.checked;
+        $('.cu_lore_mode').disabled = !lore.checked;
         $('.cu_target_hint').innerHTML = !lore.checked ? 'ไม่แตะ lorebook'
             : !name ? '<span class="cu_bad">ใส่ชื่อ lorebook</span>'
-                : exists ? `มีอยู่แล้ว → <b>เขียนทับ</b>${hasChar && name === old.world ? ' (ตัวที่ผูกกับการ์ดอยู่ตอนนี้)' : ''}`
-                    : 'ยังไม่มี → <b>สร้างใหม่</b>';
+                : asNew && exists ? '<span class="cu_bad">มี lorebook ชื่อนี้แล้ว — ตั้งชื่ออื่น</span>'
+                    : asNew ? `สร้างเล่มใหม่ <b>“${esc(name)}”</b>${keep ? `<br><small>เล่มเดิม “${esc(keep)}” คงไว้ไม่แตะ</small>` : ''}`
+                        : exists ? `มีอยู่แล้ว → <b>เขียนทับ</b>${hasChar && name === old.world ? ' (ตัวที่ผูกกับการ์ดอยู่ตอนนี้)' : ''}`
+                            : 'ยังไม่มี → <b>สร้างใหม่</b>';
         if (has('.cu_link')) {
             if (!linkTouched) $('.cu_link').checked = !old.world || name === old.world || !exists;
             $('.cu_link_row').hidden = !lore.checked;
         }
         const token = ++diffToken;
-        if (!lore.checked || !exists || !newLoreData) { $('.cu_diff').innerHTML = ''; return; }
-        const current = await loadWorld(name);
+        // A new lorebook is compared with the one it is made next to.
+        const against = asNew ? keep : (exists ? name : '');
+        if (!lore.checked || !against || !newLoreData) { $('.cu_diff').innerHTML = ''; return; }
+        const current = await loadWorld(against);
         if (token !== diffToken) return;
-        $('.cu_diff').innerHTML = current ? `เทียบกับของเดิม (${loreSigs(current).length}): ${diffText(loreDiff(current, newLoreData))}` : '';
+        $('.cu_diff').innerHTML = current ? `เทียบกับ${asNew ? ` “${esc(against)}”` : 'ของเดิม'} (${loreSigs(current).length}): ${diffText(loreDiff(current, newLoreData))}` : '';
     };
     if (has('.cu_lore')) {
         const lore = $('.cu_lore');
@@ -558,6 +617,14 @@ function planDialog(items, old) {
                 }
             });
         }
+        $('.cu_lore_mode').value = mode;
+        $('.cu_target').value = typed[mode];
+        $('.cu_lore_mode').addEventListener('change', e => {
+            typed[mode] = $('.cu_target').value;
+            mode = e.target.value;
+            $('.cu_target').value = typed[mode];
+            loreHint();
+        });
         lore.addEventListener('change', () => { $('.cu_stale').hidden = true; loreHint(); });
         $('.cu_target').addEventListener('input', loreHint);
         $('.cu_target').addEventListener('keydown', e => { if (e.key === 'Enter') e.target.blur(); });
@@ -624,7 +691,9 @@ function planDialog(items, old) {
         lore: {
             source: loreFromFile ? 'file' : 'card',
             apply: !!$('.cu_lore')?.checked,
+            mode: $('.cu_lore_mode')?.value ?? 'overwrite',
             target: $('.cu_target')?.value.trim() ?? '',
+            from: defaultTarget, // the lorebook a 'new' one is made next to
             link: hasChar && ($('.cu_link')?.checked ?? true),
             staleDefaultOff,
         },
@@ -654,6 +723,10 @@ async function askPlan(items, old) {
                 toast.warn('ใส่ชื่อ lorebook ก่อน');
                 return false;
             }
+            if (r.lore.apply && r.lore.mode === 'new' && worldNames().includes(r.lore.target)) {
+                toast.warn('มี lorebook ชื่อนี้แล้ว — ตั้งชื่ออื่นสำหรับเล่มใหม่');
+                return false;
+            }
             plan = r;
             return true;
         },
@@ -665,6 +738,7 @@ async function askPlan(items, old) {
     const s = settings();
     const shown = sel => { const n = el.querySelector(sel); return !!n && !n.closest('[hidden]'); };
     if (shown('.cu_lore') && plan.lore.source === 'card' && !plan.lore.staleDefaultOff) s.updateLore = plan.lore.apply;
+    if (shown('.cu_lore_mode') && plan.lore.apply) s.loreMode = plan.lore.mode;
     if (shown('.cu_allow')) s.allowRegex = plan.regex.allow;
     if (shown('.cu_card_rx_mode')) s.cardRegexMode = plan.regex.cardMode;
     if (shown('.cu_keep_avatar')) s.keepAvatar = plan.keepAvatar;
@@ -733,6 +807,9 @@ async function runUpdate(items, old, plan) {
         allowed: old ? isRegexAllowed(old.avatar) : null,
     };
 
+    const loreAsNew = plan.lore.apply && plan.lore.mode === 'new';
+    if (loreAsNew && worldNames().includes(plan.lore.target)) throw new Error(`มี lorebook ชื่อ “${plan.lore.target}” แล้ว — ยังไม่ได้แก้อะไร`);
+
     // The PNG on the server holds the whole current card: the undo point, and the image for a .json card.
     if (old) undo.png = await fetchAvatarPng(old.avatar);
 
@@ -770,6 +847,9 @@ async function runUpdate(items, old, plan) {
         const target = plan.lore.target;
         const existed = worldNames().includes(target);
         const before = existed ? await loadWorld(target) : null;
+        // A new lorebook: the one it is made next to stays as it is, and is what the summary compares with.
+        const kept = loreAsNew && plan.lore.from !== target && worldNames().includes(plan.lore.from) ? plan.lore.from : '';
+        const compareWith = before ?? (kept ? await loadWorld(kept) : null);
         undo.world = { name: target, data: before, existed };
         undo.loreFlag = { name: target, value: !!s.loreFromFile[target] };
         await c.saveWorldInfo(target, structuredClone(newLore), true);
@@ -792,9 +872,10 @@ async function runUpdate(items, old, plan) {
             if (plan.lore.source === 'file') reembed = true;
         }
         const n = Object.keys(newLore.entries ?? {}).length;
-        const d = before ? loreDiff(before, newLore) : null;
+        const d = compareWith ? loreDiff(compareWith, newLore) : null;
         const src = plan.lore.source === 'file' ? `จากไฟล์ ${esc(items.lore.file.name)}` : 'จากการ์ด';
-        report.push(line('ok', `Lorebook “${esc(target)}” ${existed ? 'เขียนทับ' : 'สร้างใหม่'}${src ? ` ${src}` : ''} · <b>${n}</b> ${plural(n)}${linkNote}${d ? `<br><small>${diffText(d)}</small>` : ''}`));
+        const keptNote = kept ? `<br><small>เล่มเดิม “${esc(kept)}” คงไว้ไม่แตะ${old && now.world === target && old.world === kept ? ' · ไม่ได้ผูกกับการ์ดแล้ว' : ''}</small>` : '';
+        report.push(line('ok', `Lorebook “${esc(target)}” ${existed ? 'เขียนทับ' : 'สร้างใหม่'}${src ? ` ${src}` : ''} · <b>${n}</b> ${plural(n)}${linkNote}${d ? `<br><small>${kept ? `เทียบกับ “${esc(kept)}”: ` : ''}${diffText(d)}</small>` : ''}${keptNote}`));
     } else if (newLore) {
         report.push(line('info', plan.lore.staleDefaultOff && plan.lore.source === 'card'
             ? 'ไม่ได้เขียน lorebook ที่ฝังในการ์ดทับ (lorebook ปัจจุบันมาจากไฟล์แยกที่ใหม่กว่า)'
@@ -1353,15 +1434,17 @@ async function managedPreview(chid, item) {
         }
     }
     const isCurrent = String(chid) === String(c.characterId) && !c.groupId;
+    const versions = { old: oldM?.version || String(od.character_version ?? ''), new: newM?.version || String(nd.character_version ?? '') };
     return {
-        chid, avatar: ch.avatar, name: ch.name, chat: ch.chat, isCurrent,
+        chid, avatar: ch.avatar, name: ch.name, chat: ch.chat, isCurrent, versions,
         newM, oldM, byName, scriptsIn, regexIn, owned, forceOff, book, world, worldName, lore, stale,
+        // 'new' mode: the merged lorebook is saved under this name and linked instead
+        newWorld: lore ? versionedLoreName(world, versions.new) : '',
         scripts: mergeScriptTrees(thSettingsOf(od).settings.scripts, scriptsIn, byName),
         regex: mergeCardRegex(od.extensions?.regex_scripts, regexIn, byName),
         fields: CARD_DATA_FIELDS.filter(k => k in nd && !sameJson(nd[k], od[k])),
         allowed: isRegexAllowed(ch.avatar),
         hasTH: hasTavernHelper(),
-        versions: { old: oldM?.version || String(od.character_version ?? ''), new: newM?.version || String(nd.character_version ?? '') },
     };
 }
 
@@ -1410,6 +1493,16 @@ function managedDialog(p, item) {
         <div class="cu_section">
             <div class="cu_head"><i class="fa-solid fa-book-atlas"></i> Lorebook</div>
             <div class="cu_note">${loreNote}</div>
+            ${p.lore ? `<label class="cu_field">ไฟล์ที่ผูกไว้
+                <select class="text_pole cu_lore_mode">
+                    <option value="overwrite">อัปเดตเล่มเดิม “${esc(p.world)}”</option>
+                    <option value="new">สร้างเล่มใหม่ มีเลขเวอร์ชัน (เก็บเล่มเดิมไว้)</option>
+                </select>
+            </label>
+            <div class="cu_new_world_row">
+                <input type="text" class="text_pole cu_new_world" value="${esc(p.newWorld)}" enterkeyhint="done" placeholder="ชื่อ lorebook เล่มใหม่">
+                <div class="cu_note cu_new_world_hint"></div>
+            </div>` : ''}
             ${p.lore?.forced.length ? `<div class="cu_note">ปิดกลับ (ต้องปิดไว้เสมอ): ${listNames(p.lore.forced)}</div>` : ''}
             ${p.stale.length ? `<div class="cu_note">entry ของการ์ดเดิมที่การ์ดใหม่ไม่มีแล้ว — ติ๊กตัวที่จะลบ:</div>
                 ${p.stale.map((n, i) => `<label class="checkbox_label"><input type="checkbox" class="cu_stale_entry" data-i="${i}"> ${esc(n)}</label>`).join('')}` : ''}
@@ -1423,24 +1516,55 @@ function managedDialog(p, item) {
 
     const img = el.querySelector('.cu_card_image');
     if (img) img.checked = s.useCardImage;
+    const mode = el.querySelector('.cu_lore_mode');
+    const newWorld = el.querySelector('.cu_new_world');
+    const worldHint = () => {
+        const asNew = mode.value === 'new';
+        el.querySelector('.cu_new_world_row').hidden = !asNew;
+        if (!asNew) return;
+        const name = newWorld.value.trim();
+        el.querySelector('.cu_new_world_hint').innerHTML = !name ? '<span class="cu_bad">ใส่ชื่อ lorebook</span>'
+            : worldNames().includes(name) ? '<span class="cu_bad">มี lorebook ชื่อนี้แล้ว — ตั้งชื่ออื่น</span>'
+                : `ก็อป “${esc(p.world)}” แล้วอัปเดตในเล่มใหม่ (entry ของผู้เล่นและการเปิด/ปิดติดไปด้วย) แล้วผูกกับการ์ดแทน<br><small>เล่มเดิมคงไว้ไม่แตะ</small>`;
+    };
+    if (mode) {
+        mode.value = s.loreMode;
+        mode.addEventListener('change', worldHint);
+        newWorld.addEventListener('input', worldHint);
+        newWorld.addEventListener('keydown', e => { if (e.key === 'Enter') e.target.blur(); });
+        worldHint();
+    }
     const read = () => ({
         useImage: !!img?.checked,
+        loreMode: mode?.value ?? 'overwrite',
+        newWorld: newWorld?.value.trim() ?? '',
         removeEntries: [...el.querySelectorAll('.cu_stale_entry')].filter(x => x.checked).map(x => p.stale[Number(x.dataset.i)]),
     });
-    return { el, read, showsImage: !!img };
+    return { el, read, showsImage: !!img, showsLoreMode: !!mode };
 }
 
 async function askManagedPlan(p, item) {
     const c = ctx();
-    const { el, read, showsImage } = managedDialog(p, item);
+    const { el, read, showsImage, showsLoreMode } = managedDialog(p, item);
     let plan = null;
     await new c.Popup(el, c.POPUP_TYPE.CONFIRM, '', {
         okButton: 'อัปเดต',
         cancelButton: 'ยกเลิก',
         allowVerticalScrolling: true,
-        onClosing: pp => { if (pp.result === c.POPUP_RESULT.AFFIRMATIVE) plan = read(); return true; },
+        onClosing: pp => {
+            if (pp.result !== c.POPUP_RESULT.AFFIRMATIVE) return true;
+            const r = read();
+            if (r.loreMode === 'new' && (!r.newWorld || worldNames().includes(r.newWorld))) {
+                toast.warn(r.newWorld ? 'มี lorebook ชื่อนี้แล้ว — ตั้งชื่ออื่นสำหรับเล่มใหม่' : 'ใส่ชื่อ lorebook เล่มใหม่ก่อน');
+                return false;
+            }
+            plan = r;
+            return true;
+        },
     }).show();
-    if (plan && showsImage) { settings().useCardImage = plan.useImage; save(); }
+    if (plan && showsImage) settings().useCardImage = plan.useImage;
+    if (plan && showsLoreMode) settings().loreMode = plan.loreMode;
+    if (plan) save();
     return plan;
 }
 
@@ -1502,21 +1626,26 @@ async function runManagedUpdate(item, p, plan) {
             if (!isRegexAllowed(avatar)) report.push(line('warn', 'regex ของการ์ดนี้<b>ยังไม่ได้รับอนุญาต</b>ให้ทำงาน (อนุญาตเองได้ที่ Extensions → Regex)'));
         }
 
-        // 4. the linked lorebook file — SillyTavern reads it before the embedded copy
+        // 4. the linked lorebook file — SillyTavern reads it before the embedded copy.
+        //    'new' mode: the merged copy goes into a new lorebook that is linked instead; the old one stays.
         if (p.book && p.world) {
             const before = await loadWorld(p.world);
             if (before) {
+                const asNew = plan.loreMode === 'new';
+                const target = asNew ? plan.newWorld : p.world;
+                if (asNew && worldNames().includes(target)) throw new Error(`มี lorebook ชื่อ “${target}” แล้ว`);
                 const w = mergeWorldEntries(before, c.convertCharacterBook(structuredClone(p.book)), { owned: p.owned, forceOff: p.forceOff, remove: plan.removeEntries });
-                undo.world = { name: p.world, data: before, existed: true };
-                await c.saveWorldInfo(p.world, w.book, true);
+                undo.world = asNew ? { name: target, data: null, existed: false } : { name: p.world, data: before, existed: true };
+                await c.saveWorldInfo(target, w.book, true);
                 await c.updateWorldInfoList();
-                c.reloadWorldInfoEditor?.(p.world);
+                c.reloadWorldInfoEditor?.(target);
+                if (asNew) await mergeCard(chid, { data: { extensions: { world: target } } });
                 const parts = [];
                 if (w.updated.length) parts.push(`อัปเดต ${w.updated.length}`);
                 if (w.added.length) parts.push(`เพิ่มใหม่ ${w.added.length}: ${listNames(w.added, 4)}`);
                 if (w.removed.length) parts.push(`ลบ ${w.removed.length}: ${listNames(w.removed, 4)}`);
                 parts.push(`entry ของผู้เล่น ${w.playerEntries} ไม่แตะ`);
-                report.push(line('ok', `Lorebook “${esc(p.world)}”: ${parts.join(' · ')}`));
+                report.push(line('ok', `Lorebook “${esc(target)}”${asNew ? ' (เล่มใหม่ · ผูกกับการ์ดแล้ว)' : ''}: ${parts.join(' · ')}${asNew ? `<br><small>เล่มเดิม “${esc(p.world)}” คงไว้ไม่แตะ</small>` : ''}`));
                 if (w.forced.length) report.push(line('info', `ปิด entry ที่ต้องปิดไว้เสมอ: ${listNames(w.forced)}`));
             } else {
                 report.push(line('warn', `เปิด lorebook “${esc(p.world)}” ไม่ได้ — อัปเดตแค่ชุดที่ฝังในการ์ด`));
@@ -1725,7 +1854,13 @@ function addSettings() {
                 <small>กดปุ่ม <i class="fa-solid fa-file-arrow-up"></i> ในแผงตัวละคร (ข้างปุ่ม Export) หรือปุ่มด้านล่าง แล้วเลือกการ์ด, lorebook .json หรือ regex .json — เลือกหลายไฟล์พร้อมกันได้ · ไม่ได้เปิดตัวละครไว้ก็อัปเดต lorebook และ global regex ได้</small>
                 <div class="cu_set_btn"></div>
                 <div class="cu_set_title">ค่าเริ่มต้นของหน้าต่างอัปเดต</div>
-                <label class="checkbox_label"><input type="checkbox" data-key="updateLore"> การ์ด: เขียน lorebook ที่ฝังมาทับของเดิม</label>
+                <label class="checkbox_label"><input type="checkbox" data-key="updateLore"> การ์ด: อัปเดต lorebook ที่ฝังมา</label>
+                <label class="cu_field">อัปเดต lorebook
+                    <select class="text_pole" data-key="loreMode">
+                        <option value="overwrite">เขียนทับเล่มเดิม</option>
+                        <option value="new">สร้างเล่มใหม่ มีเลขเวอร์ชัน (เก็บเล่มเดิมไว้)</option>
+                    </select>
+                </label>
                 <label class="checkbox_label"><input type="checkbox" data-key="allowRegex"> อนุญาต regex ของการ์ดอัตโนมัติ</label>
                 <label class="checkbox_label"><input type="checkbox" data-key="keepAvatar"> การ์ด .json ใช้รูปตัวละครเดิม</label>
                 <label class="checkbox_label"><input type="checkbox" data-key="useCardImage"> การ์ดที่มีสคริปต์ Tavern Helper (.png): ใช้รูปจากการ์ดใหม่</label>
@@ -1805,6 +1940,7 @@ async function reloadWithFreshFiles() {
 }
 
 globalThis.CardUpdater = { VERSION, checkForNewVersion, reloadWithFreshFiles, readPngCard, writePngCard, cardInfo, jsonKind, loreDiff, mergeRegex, cardRegexAfter, onFilesPicked,
-    cardManifest, compareVersions, isManagedCard, thSettingsOf, mergeScriptTrees, mergeCardRegex, mergeWorldEntries };
+    cardManifest, compareVersions, isManagedCard, thSettingsOf, mergeScriptTrees, mergeCardRegex, mergeWorldEntries,
+    loreBaseName, versionFromFileName, versionedLoreName };
 
 if (typeof jQuery === 'function') jQuery(init); else init();
