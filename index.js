@@ -21,7 +21,7 @@
 
 const MODULE = 'card_updater';
 const LOG = '[CardUpdater]';
-const VERSION = '1.4.1'; // keep in sync with manifest.json
+const VERSION = '1.5.0'; // keep in sync with manifest.json
 const BASE_URL = new URL('.', import.meta.url);
 const CARD_EXT = ['png', 'json', 'charx', 'yaml', 'yml', 'byaf'];
 
@@ -33,6 +33,7 @@ const DEFAULTS = Object.freeze({
     regexMode: 'merge',        // regex file: 'merge' | 'replace'
     useCardImage: true,        // Tavern Helper card (.png): take the new card's picture
     cardRegexMode: 'merge',    // new card: 'merge' keeps old scripts the card doesn't have | 'replace' uses the card's set
+    managedLoreMode: 'modify', // Tavern Helper card: 'modify' the linked lorebook | 'clean' new versioned one from the card alone
     loreFromFile: Object.freeze({}), // world name -> true when its last update came from a lorebook file
 });
 
@@ -50,6 +51,7 @@ function settings() {
     if (!['merge', 'replace'].includes(s.regexMode)) s.regexMode = 'merge';
     if (!['merge', 'replace'].includes(s.cardRegexMode)) s.cardRegexMode = 'merge';
     if (!['overwrite', 'new'].includes(s.loreMode)) s.loreMode = 'overwrite';
+    if (!['modify', 'clean'].includes(s.managedLoreMode)) s.managedLoreMode = 'modify';
     return s;
 }
 
@@ -1470,11 +1472,13 @@ async function managedPreview(chid, item) {
     const book = embeddedBook(nd, forceOff);
     const worldName = String(od.extensions?.world ?? '').trim();
     const world = worldName && worldNames().includes(worldName) ? worldName : '';
-    let lore = null, stale = [];
+    let lore = null, stale = [], leftBehind = 0;
     if (world && book) {
         const cur = await loadWorld(world);
         if (cur) {
             stale = staleCardEntries({ oldData: od, oldM, owned, world: cur });
+            const bookNames = new Set(book.entries.map(entryName));
+            leftBehind = Object.values(cur.entries ?? {}).filter(e => !bookNames.has(entryName(e))).length;
             lore = mergeWorldEntries(cur, c.convertCharacterBook(structuredClone(book)), { owned, forceOff });
         }
     }
@@ -1482,8 +1486,8 @@ async function managedPreview(chid, item) {
     const versions = { old: oldM?.version || String(od.character_version ?? ''), new: newM?.version || String(nd.character_version ?? '') };
     return {
         chid, avatar: ch.avatar, name: ch.name, chat: ch.chat, isCurrent, versions,
-        newM, oldM, byName, scriptsIn, regexIn, owned, forceOff, book, world, worldName, lore, stale,
-        // 'new' mode: the merged lorebook is saved under this name and linked instead
+        newM, oldM, byName, scriptsIn, regexIn, owned, forceOff, book, world, worldName, lore, stale, leftBehind,
+        // 'clean' mode: the card's lorebook is saved under this name and linked instead
         newWorld: lore ? versionedLoreName(world, versions.new) : '',
         scripts: mergeScriptTrees(thSettingsOf(od).settings.scripts, scriptsIn, byName),
         regex: mergeCardRegex(od.extensions?.regex_scripts, regexIn, byName),
@@ -1511,11 +1515,7 @@ function managedDialog(p, item) {
 
     const loreNote = !p.book ? 'การ์ดใหม่ไม่มี lorebook ฝังมา — ไม่แตะ lorebook'
         : `ชุดที่ฝังในการ์ด: <b>${p.book.entries.length}</b> ${plural(p.book.entries.length)} (เขียนทับทั้งชุด)<br>`
-        + (p.lore ? `ไฟล์ “${esc(p.world)}” ที่ผูกไว้: ${[
-            p.lore.updated.length ? `อัปเดต ${p.lore.updated.length}` : '',
-            p.lore.added.length ? `เพิ่มใหม่ ${p.lore.added.length}` : '',
-            `entry ของผู้เล่น ${p.lore.playerEntries} ไม่แตะ`,
-        ].filter(Boolean).join(' · ')}<br><small>entry เดิมคง uid และการเปิด/ปิดของผู้เล่นไว้</small>`
+        + (p.lore ? `ผูกไฟล์ “${esc(p.world)}” ไว้`
             : p.worldName ? `ไฟล์ “${esc(p.worldName)}” ที่ผูกไว้ไม่มีอยู่ — ใช้ชุดที่ฝังในการ์ด`
                 : 'ไม่ได้ผูกไฟล์ lorebook — ใช้ชุดที่ฝังในการ์ด');
 
@@ -1541,14 +1541,20 @@ function managedDialog(p, item) {
             <div class="cu_note">${loreNote}</div>
             ${p.lore ? `<label class="cu_field">ไฟล์ที่ผูกไว้
                 <select class="text_pole cu_lore_mode">
-                    <option value="overwrite">อัปเดตเล่มเดิม “${esc(p.world)}”</option>
-                    <option value="new">สร้างเล่มใหม่ มีเลขเวอร์ชัน (เก็บเล่มเดิมไว้)</option>
+                    <option value="modify">Modify — อัปเดตเล่มเดิม “${esc(p.world)}”</option>
+                    <option value="clean">Clean — เล่มใหม่จากการ์ดล้วน มีเลขเวอร์ชัน</option>
                 </select>
             </label>
             <div class="cu_new_world_row">
                 <input type="text" class="text_pole cu_new_world" value="${esc(p.newWorld)}" enterkeyhint="done" placeholder="ชื่อ lorebook เล่มใหม่">
                 <div class="cu_note cu_new_world_hint"></div>
             </div>` : ''}
+            <div class="cu_modify_only">
+            ${p.lore ? `<div class="cu_note">${[
+                p.lore.updated.length ? `อัปเดต ${p.lore.updated.length}` : '',
+                p.lore.added.length ? `เพิ่มใหม่ ${p.lore.added.length}` : '',
+                `entry ของผู้เล่น ${p.lore.playerEntries} ไม่แตะ`,
+            ].filter(Boolean).join(' · ')}<br><small>entry เดิมคง uid และการเปิด/ปิดของผู้เล่นไว้</small></div>` : ''}
             ${p.lore?.forced.length ? `<div class="cu_note">ปิดกลับ (ต้องปิดไว้เสมอ): ${listNames(p.lore.forced)}</div>` : ''}
             ${p.stale.length ? `<div class="cu_note">entry ของการ์ดเดิมที่การ์ดใหม่ไม่มีแล้ว — ติ๊กตัวที่จะลบ:<br><small>${p.oldM
                 ? 'ติ๊กไว้ให้แล้วถ้าเนื้อหายังตรงกับของในการ์ดเดิม ตัวที่ผู้เล่นแก้แล้วไม่ติ๊ก'
@@ -1556,6 +1562,7 @@ function managedDialog(p, item) {
                 ${p.stale.map((x, i) => `<label class="checkbox_label"><input type="checkbox" class="cu_stale_entry" data-i="${i}"${x.preselect ? ' checked' : ''}> ${esc(x.name)}${
                     x.constant ? ' <span class="cu_tag" title="ส่งเข้า prompt ทุกเทิร์น">เปิดตลอด</span>' : ''}${
                     x.edited ? ' <span class="cu_tag cu_tag_edited">ผู้เล่นแก้แล้ว</span>' : ''}</label>`).join('')}` : ''}
+            </div>
         </div>
         <div class="cu_section">
             <div class="cu_head"><i class="fa-solid fa-address-card"></i> ข้อมูลการ์ด</div>
@@ -1569,16 +1576,19 @@ function managedDialog(p, item) {
     const mode = el.querySelector('.cu_lore_mode');
     const newWorld = el.querySelector('.cu_new_world');
     const worldHint = () => {
-        const asNew = mode.value === 'new';
-        el.querySelector('.cu_new_world_row').hidden = !asNew;
-        if (!asNew) return;
+        const clean = mode.value === 'clean';
+        el.querySelector('.cu_new_world_row').hidden = !clean;
+        el.querySelector('.cu_modify_only').hidden = clean;
+        if (!clean) return;
         const name = newWorld.value.trim();
         el.querySelector('.cu_new_world_hint').innerHTML = !name ? '<span class="cu_bad">ใส่ชื่อ lorebook</span>'
             : worldNames().includes(name) ? '<span class="cu_bad">มี lorebook ชื่อนี้แล้ว — ตั้งชื่ออื่น</span>'
-                : `ก็อป “${esc(p.world)}” แล้วอัปเดตในเล่มใหม่ (entry ของผู้เล่นและการเปิด/ปิดติดไปด้วย) แล้วผูกกับการ์ดแทน<br><small>เล่มเดิมคงไว้ไม่แตะ</small>`;
+                : `สร้างเล่มใหม่จาก lorebook ในการ์ดอย่างเดียว (${p.book.entries.length} ${plural(p.book.entries.length)}) แล้วผูกกับการ์ดแทน · เล่มเดิม “${esc(p.world)}” คงไว้ ลบเองได้ที่ World Info`
+                    + (p.leftBehind ? `<br><span class="cu_bad">เล่มเดิมมี ${p.leftBehind} entry ที่การ์ดใหม่ไม่มี (เช่นที่ผู้เล่นเพิ่มเอง หรือที่การ์ดตัด/เปลี่ยนชื่อ) — ไม่ตามมาเล่มใหม่</span>` : '')
+                    + '<br><small>การเปิด/ปิดและการแก้ไขของผู้เล่นไม่ตามมา ใช้ค่าตามการ์ด</small>';
     };
     if (mode) {
-        mode.value = s.loreMode;
+        mode.value = s.managedLoreMode;
         mode.addEventListener('change', worldHint);
         newWorld.addEventListener('input', worldHint);
         newWorld.addEventListener('keydown', e => { if (e.key === 'Enter') e.target.blur(); });
@@ -1586,9 +1596,9 @@ function managedDialog(p, item) {
     }
     const read = () => ({
         useImage: !!img?.checked,
-        loreMode: mode?.value ?? 'overwrite',
+        loreMode: mode?.value ?? 'modify',
         newWorld: newWorld?.value.trim() ?? '',
-        removeEntries: [...el.querySelectorAll('.cu_stale_entry')].filter(x => x.checked).map(x => p.stale[Number(x.dataset.i)].name),
+        removeEntries: mode?.value === 'clean' ? [] : [...el.querySelectorAll('.cu_stale_entry')].filter(x => x.checked).map(x => p.stale[Number(x.dataset.i)].name),
     });
     return { el, read, showsImage: !!img, showsLoreMode: !!mode };
 }
@@ -1604,7 +1614,7 @@ async function askManagedPlan(p, item) {
         onClosing: pp => {
             if (pp.result !== c.POPUP_RESULT.AFFIRMATIVE) return true;
             const r = read();
-            if (r.loreMode === 'new' && (!r.newWorld || worldNames().includes(r.newWorld))) {
+            if (r.loreMode === 'clean' && (!r.newWorld || worldNames().includes(r.newWorld))) {
                 toast.warn(r.newWorld ? 'มี lorebook ชื่อนี้แล้ว — ตั้งชื่ออื่นสำหรับเล่มใหม่' : 'ใส่ชื่อ lorebook เล่มใหม่ก่อน');
                 return false;
             }
@@ -1613,7 +1623,7 @@ async function askManagedPlan(p, item) {
         },
     }).show();
     if (plan && showsImage) settings().useCardImage = plan.useImage;
-    if (plan && showsLoreMode) settings().loreMode = plan.loreMode;
+    if (plan && showsLoreMode) settings().managedLoreMode = plan.loreMode;
     if (plan) save();
     return plan;
 }
@@ -1677,25 +1687,33 @@ async function runManagedUpdate(item, p, plan) {
         }
 
         // 4. the linked lorebook file — SillyTavern reads it before the embedded copy.
-        //    'new' mode: the merged copy goes into a new lorebook that is linked instead; the old one stays.
+        //    'clean' mode: the card's lorebook alone goes into a new lorebook that is linked instead; the old one stays.
         if (p.book && p.world) {
             const before = await loadWorld(p.world);
-            if (before) {
-                const asNew = plan.loreMode === 'new';
-                const target = asNew ? plan.newWorld : p.world;
-                if (asNew && worldNames().includes(target)) throw new Error(`มี lorebook ชื่อ “${target}” แล้ว`);
-                const w = mergeWorldEntries(before, c.convertCharacterBook(structuredClone(p.book)), { owned: p.owned, forceOff: p.forceOff, remove: plan.removeEntries });
-                undo.world = asNew ? { name: target, data: null, existed: false } : { name: p.world, data: before, existed: true };
-                await c.saveWorldInfo(target, w.book, true);
+            if (before && plan.loreMode === 'clean') {
+                const target = plan.newWorld;
+                if (worldNames().includes(target)) throw new Error(`มี lorebook ชื่อ “${target}” แล้ว`);
+                const fresh = c.convertCharacterBook(structuredClone(p.book));
+                undo.world = { name: target, data: null, existed: false };
+                await c.saveWorldInfo(target, fresh, true);
                 await c.updateWorldInfoList();
                 c.reloadWorldInfoEditor?.(target);
-                if (asNew) await mergeCard(chid, { data: { extensions: { world: target } } });
+                await mergeCard(chid, { data: { extensions: { world: target } } });
+                const n = Object.keys(fresh.entries ?? {}).length;
+                report.push(line('ok', `Lorebook “${esc(target)}” (เล่มใหม่จากการ์ด · ผูกกับการ์ดแล้ว): ${n} ${plural(n)}<br><small>เล่มเดิม “${esc(p.world)}” คงไว้ไม่แตะ ลบเองได้ที่ World Info</small>`));
+                if (p.leftBehind) report.push(line('info', `entry ${p.leftBehind} ตัวที่การ์ดใหม่ไม่มียังอยู่ในเล่มเดิม “${esc(p.world)}” — ถ้าเป็นของผู้เล่นให้ก็อปมาเอง`));
+            } else if (before) {
+                const w = mergeWorldEntries(before, c.convertCharacterBook(structuredClone(p.book)), { owned: p.owned, forceOff: p.forceOff, remove: plan.removeEntries });
+                undo.world = { name: p.world, data: before, existed: true };
+                await c.saveWorldInfo(p.world, w.book, true);
+                await c.updateWorldInfoList();
+                c.reloadWorldInfoEditor?.(p.world);
                 const parts = [];
                 if (w.updated.length) parts.push(`อัปเดต ${w.updated.length}`);
                 if (w.added.length) parts.push(`เพิ่มใหม่ ${w.added.length}: ${listNames(w.added, 4)}`);
                 if (w.removed.length) parts.push(`ลบ ${w.removed.length}: ${listNames(w.removed, 4)}`);
                 parts.push(`entry ของผู้เล่น ${w.playerEntries} ไม่แตะ`);
-                report.push(line('ok', `Lorebook “${esc(target)}”${asNew ? ' (เล่มใหม่ · ผูกกับการ์ดแล้ว)' : ''}: ${parts.join(' · ')}${asNew ? `<br><small>เล่มเดิม “${esc(p.world)}” คงไว้ไม่แตะ</small>` : ''}`));
+                report.push(line('ok', `Lorebook “${esc(p.world)}”: ${parts.join(' · ')}`));
                 if (w.forced.length) report.push(line('info', `ปิด entry ที่ต้องปิดไว้เสมอ: ${listNames(w.forced)}`));
             } else {
                 report.push(line('warn', `เปิด lorebook “${esc(p.world)}” ไม่ได้ — อัปเดตแค่ชุดที่ฝังในการ์ด`));
@@ -1910,6 +1928,12 @@ function addSettings() {
                     <select class="text_pole" data-key="loreMode">
                         <option value="overwrite">เขียนทับเล่มเดิม</option>
                         <option value="new">สร้างเล่มใหม่ มีเลขเวอร์ชัน (เก็บเล่มเดิมไว้)</option>
+                    </select>
+                </label>
+                <label class="cu_field">การ์ดที่มีสคริปต์ Tavern Helper: lorebook ที่ผูกไว้
+                    <select class="text_pole" data-key="managedLoreMode">
+                        <option value="modify">Modify — อัปเดตเล่มเดิม</option>
+                        <option value="clean">Clean — เล่มใหม่จากการ์ดล้วน มีเลขเวอร์ชัน</option>
                     </select>
                 </label>
                 <label class="checkbox_label"><input type="checkbox" data-key="allowRegex"> อนุญาต regex ของการ์ดอัตโนมัติ</label>
