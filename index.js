@@ -21,7 +21,7 @@
 
 const MODULE = 'card_updater';
 const LOG = '[CardUpdater]';
-const VERSION = '1.4.0'; // keep in sync with manifest.json
+const VERSION = '1.4.1'; // keep in sync with manifest.json
 const BASE_URL = new URL('.', import.meta.url);
 const CARD_EXT = ['png', 'json', 'charx', 'yaml', 'yml', 'byaf'];
 
@@ -1067,13 +1067,22 @@ async function withLoader(fn) {
 const TH_FIELD = 'tavern_helper';
 const REGEX_OVERWRITE = ['scriptName', 'findRegex', 'replaceString', 'trimStrings', 'placement', 'markdownOnly', 'promptOnly', 'runOnEdit', 'substituteRegex', 'minDepth', 'maxDepth'];
 const CARD_V1_FIELDS = ['description', 'personality', 'scenario', 'first_mes', 'mes_example'];
-const CARD_DATA_FIELDS = [...CARD_V1_FIELDS, 'creator_notes', 'system_prompt', 'post_history_instructions', 'alternate_greetings', 'tags', 'creator', 'character_version'];
+// Paths inside `data`; a dotted one is a single key under an object (extensions keep the rest).
+const CARD_DATA_FIELDS = [...CARD_V1_FIELDS, 'creator_notes', 'system_prompt', 'post_history_instructions', 'alternate_greetings', 'group_only_greetings', 'tags', 'creator', 'character_version', 'extensions.depth_prompt'];
 
 const cardData = card => (card?.data && typeof card.data === 'object' ? card.data : (card ?? {}));
 const strList = v => (Array.isArray(v) ? v.map(String) : []);
 const sameJson = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const isPlainObject = v => !!v && typeof v === 'object' && !Array.isArray(v);
 const entryName = e => String(e?.comment ?? '');
+const hasPath = (o, path) => { let v = o; for (const k of path.split('.')) { if (!isPlainObject(v) || !(k in v)) return false; v = v[k]; } return true; };
+const getPath = (o, path) => path.split('.').reduce((v, k) => v?.[k], o);
+function setPath(o, path, value) {
+    const keys = path.split('.');
+    const last = keys.pop();
+    for (const k of keys) o = isPlainObject(o[k]) ? o[k] : (o[k] = {});
+    o[last] = value;
+}
 
 /** The `card_updater` manifest of a card's data, normalized, or null. */
 function cardManifest(data) {
@@ -1289,6 +1298,43 @@ function embeddedBook(data, forceOff) {
     return b;
 }
 
+/** An entry's text and keys, the same for a lorebook file entry and a character_book one. */
+const entryBody = e => JSON.stringify([
+    String(e?.content ?? '').trim(),
+    strList(e?.key ?? e?.keys).map(k => k.trim()),
+    strList(e?.keysecondary ?? e?.secondary_keys).map(k => k.trim()),
+]);
+
+/**
+ * The old card's lorebook entries the new card no longer owns but the linked lorebook file still has.
+ * Old ownership comes from the old manifest, or — the card had none — from the lorebook embedded in
+ * the old card (an earlier update wrote it there). Each is `{ name, constant, edited, preselect }`:
+ * `edited` compares the file with what the card shipped (null when that isn't known) and `preselect`
+ * ticks it for removal only when the entry is surely the card's and the player didn't change it.
+ * SillyTavern re-embeds the whole linked file into the card when the character is saved, so the
+ * embedded book is trusted as "what the card shipped" only when it holds nothing but the old card's
+ * own entries; without a manifest the import-time copy (`originalData`) is used instead.
+ */
+function staleCardEntries({ oldData, oldM, owned, world }) {
+    const embedded = Array.isArray(oldData?.character_book?.entries) ? oldData.character_book.entries : [];
+    const oldOwned = oldM ? oldM.owned : embedded.map(entryName).filter(Boolean);
+    const ownedSet = new Set(owned);
+    const inFile = Object.values(world?.entries ?? {}).filter(isPlainObject);
+    const imported = Array.isArray(world?.originalData?.entries) ? world.originalData.entries : [];
+    const embeddedIsCards = !!oldM && embedded.every(e => oldM.owned.includes(entryName(e)));
+    const shipped = name => (oldM ? (embeddedIsCards ? embedded : []) : imported).find(e => entryName(e) === name);
+    const out = [];
+    for (const name of new Set(oldOwned)) {
+        if (!name || ownedSet.has(name)) continue;
+        const copies = inFile.filter(e => entryName(e) === name);
+        if (!copies.length) continue;
+        const ref = shipped(name);
+        const edited = ref ? copies.some(e => entryBody(e) !== entryBody(ref)) : null;
+        out.push({ name, constant: copies.some(e => !!e.constant), edited, preselect: edited === false });
+    }
+    return out;
+}
+
 /** Merge like the server's deepMerge: objects key by key, anything else (arrays too) replaced. */
 function deepAssign(target, patch) {
     for (const [k, v] of Object.entries(patch)) {
@@ -1428,8 +1474,7 @@ async function managedPreview(chid, item) {
     if (world && book) {
         const cur = await loadWorld(world);
         if (cur) {
-            const names = Object.values(cur.entries ?? {}).map(entryName);
-            stale = oldM && newM ? [...new Set(oldM.owned.filter(n => !newM.owned.includes(n) && names.includes(n)))] : [];
+            stale = staleCardEntries({ oldData: od, oldM, owned, world: cur });
             lore = mergeWorldEntries(cur, c.convertCharacterBook(structuredClone(book)), { owned, forceOff });
         }
     }
@@ -1442,7 +1487,7 @@ async function managedPreview(chid, item) {
         newWorld: lore ? versionedLoreName(world, versions.new) : '',
         scripts: mergeScriptTrees(thSettingsOf(od).settings.scripts, scriptsIn, byName),
         regex: mergeCardRegex(od.extensions?.regex_scripts, regexIn, byName),
-        fields: CARD_DATA_FIELDS.filter(k => k in nd && !sameJson(nd[k], od[k])),
+        fields: CARD_DATA_FIELDS.filter(k => hasPath(nd, k) && !sameJson(getPath(nd, k), getPath(od, k))),
         allowed: isRegexAllowed(ch.avatar),
         hasTH: hasTavernHelper(),
     };
@@ -1479,7 +1524,8 @@ function managedDialog(p, item) {
         <div class="cu_row"><i class="fa-solid fa-id-card"></i> <span><b>${esc(item.file.name)}</b> → <code>${esc(p.avatar)}</code>${p.isCurrent ? '' : ' <small>(ไม่ได้เปิดอยู่)</small>'}<br>
             <small>${v.old || v.new ? `v${esc(v.old || '?')} → <b>v${esc(v.new || '?')}</b> · ` : ''}อัปเดตทีละส่วน: ความคืบหน้าในแชท ตัวแปร และค่าที่ผู้เล่นตั้งไว้คงเดิม</small></span></div>
         ${next.name && !sameName(next.name, p.name) ? warn(`ชื่อในไฟล์คือ “${esc(next.name)}” ไม่ตรงกับ “${esc(p.name)}” — เลือกไฟล์ถูกหรือเปล่า?`) : ''}
-        ${p.byName ? warn('การ์ดเดิมไม่มีข้อมูลสำหรับอัปเดต (manifest) — จับคู่สคริปต์และ regex <b>ด้วยชื่อ</b> ซึ่งอาจไม่แม่นยำ ตรวจดูหลังอัปเดต') : ''}
+        ${!p.newM ? warn('การ์ดใหม่ไม่มีข้อมูลสำหรับอัปเดต (manifest) — จับคู่สคริปต์และ regex <b>ด้วยชื่อ</b> ตรวจดูหลังอัปเดตว่าไม่ซ้ำ')
+        : !p.oldM ? `<div class="cu_note"><i class="fa-solid fa-circle-info"></i> การ์ดเดิมยังไม่มีข้อมูลสำหรับอัปเดต (manifest) — ครั้งนี้จับคู่สคริปต์และ regex ด้วยชื่อ<b>แค่ครั้งแรก</b> แล้วจะบันทึก manifest ไว้ ครั้งต่อไปจับคู่ด้วย id และจะไม่เตือนอีก</div>` : ''}
         <div class="cu_section">
             <div class="cu_head"><i class="fa-solid fa-scroll"></i> สคริปต์ Tavern Helper</div>
             <div class="cu_note">${mergeText(p.scripts, 'สคริปต์')}<br><small>เปิด/ปิด ตัวแปรของสคริปต์ และการแสดงปุ่มคงเดิม</small></div>
@@ -1504,8 +1550,12 @@ function managedDialog(p, item) {
                 <div class="cu_note cu_new_world_hint"></div>
             </div>` : ''}
             ${p.lore?.forced.length ? `<div class="cu_note">ปิดกลับ (ต้องปิดไว้เสมอ): ${listNames(p.lore.forced)}</div>` : ''}
-            ${p.stale.length ? `<div class="cu_note">entry ของการ์ดเดิมที่การ์ดใหม่ไม่มีแล้ว — ติ๊กตัวที่จะลบ:</div>
-                ${p.stale.map((n, i) => `<label class="checkbox_label"><input type="checkbox" class="cu_stale_entry" data-i="${i}"> ${esc(n)}</label>`).join('')}` : ''}
+            ${p.stale.length ? `<div class="cu_note">entry ของการ์ดเดิมที่การ์ดใหม่ไม่มีแล้ว — ติ๊กตัวที่จะลบ:<br><small>${p.oldM
+                ? 'ติ๊กไว้ให้แล้วถ้าเนื้อหายังตรงกับของในการ์ดเดิม ตัวที่ผู้เล่นแก้แล้วไม่ติ๊ก'
+                : 'การ์ดเดิมไม่มี manifest — รายการนี้มาจาก lorebook ที่ฝังในการ์ดเดิม อาจมี entry ที่ผู้เล่นเพิ่มเอง ดูก่อนติ๊ก'}</small></div>
+                ${p.stale.map((x, i) => `<label class="checkbox_label"><input type="checkbox" class="cu_stale_entry" data-i="${i}"${x.preselect ? ' checked' : ''}> ${esc(x.name)}${
+                    x.constant ? ' <span class="cu_tag" title="ส่งเข้า prompt ทุกเทิร์น">เปิดตลอด</span>' : ''}${
+                    x.edited ? ' <span class="cu_tag cu_tag_edited">ผู้เล่นแก้แล้ว</span>' : ''}</label>`).join('')}` : ''}
         </div>
         <div class="cu_section">
             <div class="cu_head"><i class="fa-solid fa-address-card"></i> ข้อมูลการ์ด</div>
@@ -1538,7 +1588,7 @@ function managedDialog(p, item) {
         useImage: !!img?.checked,
         loreMode: mode?.value ?? 'overwrite',
         newWorld: newWorld?.value.trim() ?? '',
-        removeEntries: [...el.querySelectorAll('.cu_stale_entry')].filter(x => x.checked).map(x => p.stale[Number(x.dataset.i)]),
+        removeEntries: [...el.querySelectorAll('.cu_stale_entry')].filter(x => x.checked).map(x => p.stale[Number(x.dataset.i)].name),
     });
     return { el, read, showsImage: !!img, showsLoreMode: !!mode };
 }
@@ -1609,7 +1659,7 @@ async function runManagedUpdate(item, p, plan) {
         // 2. card fields and the embedded lorebook
         const patch = { data: {} };
         for (const k of CARD_V1_FIELDS) if (k in nd) patch[k] = nd[k];
-        for (const k of CARD_DATA_FIELDS) if (k in nd) patch.data[k] = nd[k];
+        for (const k of CARD_DATA_FIELDS) if (hasPath(nd, k)) setPath(patch.data, k, getPath(nd, k));
         if ('creator_notes' in nd) patch.creatorcomment = nd.creator_notes;
         if (p.book) patch.data.character_book = p.book;
         undo.cardTouched = true;
@@ -1702,7 +1752,8 @@ async function runManagedUpdate(item, p, plan) {
         if (!p.hasTH) report.push(line('warn', 'ยังไม่ได้ติดตั้ง <b>Tavern Helper (JS-Slash-Runner)</b> — ต้องติดตั้งก่อนบอทถึงจะทำงาน'));
         else if (!p.isCurrent) report.push(line('info', 'สคริปต์ใหม่จะทำงานเมื่อเปิดตัวละครนี้ครั้งถัดไป'));
     }
-    if (!failed && p.byName) report.push(line('warn', 'การ์ดเดิมไม่มี manifest — จับคู่ด้วยชื่อ ตรวจดูสคริปต์และ regex ว่าไม่ซ้ำ'));
+    if (!failed && !p.newM) report.push(line('warn', 'การ์ดใหม่ไม่มี manifest — จับคู่ด้วยชื่อ ตรวจดูสคริปต์และ regex ว่าไม่ซ้ำ'));
+    else if (!failed && !p.oldM) report.push(line('info', 'การ์ดเดิมไม่มี manifest — ครั้งนี้จับคู่ด้วยชื่อ บันทึก manifest แล้ว ครั้งต่อไปจับคู่ด้วย id'));
     report.push(line('info', 'ความคืบหน้าในแชทและตัวแปรของผู้เล่นไม่ถูกแตะ'));
     if (reloadHint) report.push(line('warn', 'เขียนสคริปต์ลงการ์ดโดยตรงขณะการ์ดเปิดอยู่ — <b>รีเฟรชหน้า</b>ก่อนเล่นต่อ'));
 
@@ -1940,7 +1991,7 @@ async function reloadWithFreshFiles() {
 }
 
 globalThis.CardUpdater = { VERSION, checkForNewVersion, reloadWithFreshFiles, readPngCard, writePngCard, cardInfo, jsonKind, loreDiff, mergeRegex, cardRegexAfter, onFilesPicked,
-    cardManifest, compareVersions, isManagedCard, thSettingsOf, mergeScriptTrees, mergeCardRegex, mergeWorldEntries,
+    cardManifest, compareVersions, isManagedCard, thSettingsOf, mergeScriptTrees, mergeCardRegex, mergeWorldEntries, staleCardEntries,
     loreBaseName, versionFromFileName, versionedLoreName };
 
 if (typeof jQuery === 'function') jQuery(init); else init();

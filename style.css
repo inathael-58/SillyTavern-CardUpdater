@@ -130,3 +130,16 @@
     opacity: 0.6;
     font-weight: normal;
 }
+
+.cu_tag {
+    font-size: 0.8em;
+    padding: 0 6px;
+    border-radius: 8px;
+    border: 1px solid var(--SmartThemeBorderColor, currentColor);
+    opacity: 0.85;
+    white-space: nowrap;
+}
+
+.cu_tag_edited {
+    color: var(--warning, #e8a33d);
+}
