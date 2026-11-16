@@ -143,3 +143,15 @@
 .cu_tag_edited {
     color: var(--warning, #e8a33d);
 }
+
+/* The file input CardUpdater.open() clicks: invisible but laid out (iOS won't open a display:none one). */
+.cu_api_file {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+    overflow: hidden;
+}

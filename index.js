@@ -16,12 +16,14 @@
  * One dialog before, one summary after, with an Undo button.
  *
  * It is a real button (a <label> around a file input), so the file picker also
- * opens on iPhone/iPad, where the built-in "Replace / Update" can't open it.
+ * opens on iPhone/iPad, where the built-in "Replace / Update" can't open it. *
+ * Other extensions (Reverie) start an update for a given character with
+ * globalThis.CardUpdater.open({ avatar }) — see "public API" near the end.
  */
 
 const MODULE = 'card_updater';
 const LOG = '[CardUpdater]';
-const VERSION = '1.5.0'; // keep in sync with manifest.json
+const VERSION = '1.6.0'; // keep in sync with manifest.json
 const BASE_URL = new URL('.', import.meta.url);
 const CARD_EXT = ['png', 'json', 'charx', 'yaml', 'yml', 'byaf'];
 
@@ -493,7 +495,7 @@ function planDialog(items, old) {
         ? `<div class="cu_warn"><i class="fa-solid fa-triangle-exclamation"></i> ชื่อในไฟล์คือ “${esc(next.name)}” ไม่ตรงกับ “${esc(old.name)}” — เลือกไฟล์ถูกหรือเปล่า?</div>` : '';
 
     const cardBlock = card ? `
-        <div class="cu_row"><i class="fa-solid fa-id-card"></i> <span><b>${esc(card.file.name)}</b> → เขียนทับ <code>${esc(old.avatar)}</code><br><small>ชื่อไฟล์เดิม · แชททั้งหมดยังเชื่อมอยู่</small></span></div>
+        <div class="cu_row"><i class="fa-solid fa-id-card"></i> <span><b>${esc(card.file.name)}</b> → เขียนทับ <code>${esc(old.avatar)}</code>${old.isCurrent ? '' : ' <small>(ไม่ได้เปิดอยู่)</small>'}<br><small>ชื่อไฟล์เดิม · แชททั้งหมดยังเชื่อมอยู่</small></span></div>
         ${warnName}
         ${card.ext === 'json' ? '<label class="checkbox_label"><input type="checkbox" class="cu_keep_avatar"> ใช้รูปตัวละครเดิม (ไฟล์ .json ไม่มีรูป)</label>' : ''}
         ${['yaml', 'yml'].includes(card.ext) ? '<div class="cu_warn"><i class="fa-solid fa-triangle-exclamation"></i> ไฟล์ .yaml ไม่มีรูป รูปตัวละครจะกลายเป็นรูปเริ่มต้น</div>' : ''}` : '';
@@ -807,6 +809,7 @@ async function runUpdate(items, old, plan) {
         loreFlag: null,
         globalRegex: null,
         allowed: old ? isRegexAllowed(old.avatar) : null,
+        show: old ? old.isCurrent : undefined, // undo reopens the character only if it was open
     };
 
     const loreAsNew = plan.lore.apply && plan.lore.mode === 'new';
@@ -966,11 +969,13 @@ async function runUpdate(items, old, plan) {
         if (off) report.push(line('info', `ในไฟล์มี regex ที่ปิดไว้ ${off} ตัว`));
     }
 
-    if (old && chid !== undefined) {
+    if (old?.isCurrent && chid !== undefined) {
         await showAgain(chid, old.chat);
         // A lorebook updated from its own file: let SillyTavern re-embed it in the card too, so exports carry it.
         if (reembed) { resaveCharacterForm(chid); undo.cardTouched = true; }
     } else {
+        // A character that isn't open (another extension asked for it) stays closed; the chat on screen just reloads.
+        if (reembed) report.push(line('info', 'lorebook ใหม่จะฝังลงในการ์ดเมื่อบันทึกตัวละครนี้ครั้งถัดไป (ตัวละครไม่ได้เปิดอยู่)'));
         await refreshChat();
     }
     return { report, undo };
@@ -1407,7 +1412,8 @@ const hasTavernHelper = () => typeof globalThis.TavernHelper?.updateScriptTreesW
 /**
  * Which character a Tavern Helper card updates: the ones whose manifest has the same bot_id, or
  * (without a manifest) the same name; the open character too unless its bot_id differs.
- * Asks when there is more than one. Returns a chid, or undefined (message already shown).
+ * Asks when there is more than one. Returns a chid; null when there is none (message already shown);
+ * undefined when the choice was cancelled.
  */
 async function pickManagedTarget(next, newM, old) {
     const c = ctx();
@@ -1432,7 +1438,7 @@ async function pickManagedTarget(next, newM, old) {
         await c.Popup.show.text('อัปเดตไม่ได้', openConflict
             ? `การ์ดนี้เป็นของบอท <code>${esc(botId)}</code> แต่ตัวละครที่เปิดอยู่เป็นของ <code>${esc(openM.botId)}</code> — ไม่อัปเดต`
             : `ไม่พบตัวละคร “${esc(next.name)}” ที่จะอัปเดต — เปิดตัวละครนั้นก่อนแล้วลองใหม่`);
-        return undefined;
+        return null;
     }
     if (options.length === 1) return options[0].chid;
 
@@ -1787,33 +1793,43 @@ async function runManagedUpdate(item, p, plan) {
     };
 }
 
-async function updateManagedCard(item, old) {
+/**
+ * Returns 'updated' | 'cancelled' | 'failed' (see open()). `fixed`: `old` was named by the caller
+ * (CardUpdater.open({ avatar })), so it is the target — no search for other characters with the same bot.
+ */
+async function updateManagedCard(item, old, fixed = false) {
     const c = ctx();
     const next = cardInfo(item.card);
     const newM = cardManifest(cardData(item.card));
-    const chid = await pickManagedTarget(next, newM, old);
-    if (chid === undefined) return;
+    let chid;
+    if (fixed) chid = Number(old.chid);
+    else {
+        chid = await pickManagedTarget(next, newM, old);
+        if (chid === null) return 'failed'; // nothing to update (message shown)
+        if (chid === undefined) return 'cancelled'; // the "which character?" dialog was closed
+    }
     const p = await managedPreview(chid, item);
     if (p.newM?.botId && p.oldM?.botId && p.newM.botId !== p.oldM.botId) {
         await c.Popup.show.text('อัปเดตไม่ได้', `การ์ดนี้เป็นของบอท <code>${esc(p.newM.botId)}</code> แต่ “${esc(p.name)}” เป็นของ <code>${esc(p.oldM.botId)}</code>`);
-        return;
+        return 'failed';
     }
     const v = p.versions;
     if (v.old && v.new && compareVersions(v.new, v.old) <= 0) {
         const ok = await c.Popup.show.confirm('เวอร์ชันไม่ได้ใหม่กว่า',
             `ไฟล์เป็น <b>v${esc(v.new)}</b> แต่ “${esc(p.name)}” เป็น <b>v${esc(v.old)}</b> อยู่แล้ว — อัปเดตต่อไหม?`);
-        if (ok !== c.POPUP_RESULT.AFFIRMATIVE) return;
+        if (ok !== c.POPUP_RESULT.AFFIRMATIVE) return 'cancelled';
     }
     const plan = await askManagedPlan(p, item);
-    if (!plan) return;
+    if (!plan) return 'cancelled';
     if (isGenerating() || ctx().characters[chid]?.avatar !== p.avatar || (p.isCurrent && String(ctx().characterId) !== String(chid))) {
         toast.warn('ตัวละครเปลี่ยนไป หรือบอทกำลังตอบ — ยกเลิกการอัปเดต');
-        return;
+        return 'failed';
     }
     const result = await withLoader(() => runManagedUpdate(item, p, plan));
     busy = false;
     if (result.doneToast) toast.ok(result.doneToast);
     await showReport(result);
+    return result.title ? 'failed' : 'updated'; // a title means it only partly went through
 }
 
 // ---------------------------------------------------------------- entry point
@@ -1827,50 +1843,73 @@ function blocker() {
     return null;
 }
 
+/** The character at `chid` as the update flow needs it; `isCurrent` when it is the open (single) chat. */
+async function characterAt(chid) {
+    const c = ctx();
+    if (chid === undefined || !c.characters[chid]) return null;
+    await c.unshallowCharacter?.(chid);
+    const char = ctx().characters[chid];
+    const isCurrent = !c.groupId && String(c.characterId) === String(chid);
+    return { chid, isCurrent, avatar: char.avatar, name: char.name, chat: char.chat, ...cardInfo({ data: char.data }) };
+}
+
 /** The open (single) character, or null. */
 async function currentCharacter() {
     const c = ctx();
-    const chid = c.characterId;
-    if (c.groupId || c.menuType === 'create' || chid === undefined || !c.characters[chid]) return null;
-    await c.unshallowCharacter?.(chid);
-    const char = ctx().characters[chid];
-    return { chid, avatar: char.avatar, name: char.name, chat: char.chat, ...cardInfo({ data: char.data }) };
+    if (c.groupId || c.menuType === 'create') return null;
+    return characterAt(c.characterId);
 }
 
-async function onFilesPicked(files) {
+const notFoundText = avatar => `ไม่พบตัวละคร <code>${esc(avatar)}</code> — อาจถูกลบหรือเปลี่ยนชื่อไฟล์ไปแล้ว`;
+
+/**
+ * Run the update for the picked files. `avatar` (from CardUpdater.open) names the character to update;
+ * without it, the open one. Returns 'updated' | 'cancelled' | 'failed' — every failure is shown to the user.
+ */
+async function onFilesPicked(files, { avatar } = {}) {
     const why = blocker();
-    if (why) { toast.warn(why); return; }
+    if (why) { toast.warn(why); return 'failed'; }
     busy = true;
     try {
         const c = ctx();
         const items = await classifyFiles(files);
         if (typeof items === 'string') {
             await c.Popup.show.text('อัปเดตไม่ได้', items);
-            return;
+            return 'failed';
         }
-        const old = await currentCharacter();
+        let old;
+        if (avatar) {
+            old = await characterAt(findChid(avatar)); // looked up again: the list may have changed while picking
+            if (!old) { await c.Popup.show.text('อัปเดตไม่ได้', notFoundText(avatar)); return 'failed'; }
+        } else {
+            old = await currentCharacter();
+        }
         if (items.card?.card && isManagedCard(items.card.card)) {
             if (items.lore || items.regex) {
                 await c.Popup.show.text('อัปเดตไม่ได้', 'การ์ดนี้มีสคริปต์ Tavern Helper — เลือกไฟล์การ์ดไฟล์เดียว (lorebook และ regex อยู่ในการ์ดแล้ว)');
-                return;
+                return 'failed';
             }
-            await updateManagedCard(items.card, old);
-            return;
+            return await updateManagedCard(items.card, old, !!avatar);
         }
-        if (items.card && !old) { toast.warn('เปิดตัวละครที่จะอัปเดตการ์ดก่อน (ใช้กับแชทกลุ่มไม่ได้)'); return; }
+        if (items.card && !old) { toast.warn('เปิดตัวละครที่จะอัปเดตการ์ดก่อน (ใช้กับแชทกลุ่มไม่ได้)'); return 'failed'; }
 
         const plan = await askPlan(items, old);
-        if (!plan) return;
-        if (String(ctx().characterId ?? '') !== String(old?.chid ?? '') || isGenerating()) {
+        if (!plan) return 'cancelled';
+        const moved = old && !old.isCurrent
+            ? ctx().characters[old.chid]?.avatar !== old.avatar
+            : String(ctx().characterId ?? '') !== String(old?.chid ?? '');
+        if (moved || isGenerating()) {
             toast.warn('ตัวละครที่เปิดอยู่เปลี่ยนไป หรือบอทกำลังตอบ — ยกเลิกการอัปเดต');
-            return;
+            return 'failed';
         }
         const result = await withLoader(() => runUpdate(items, old, plan));
         busy = false;
         await showReport(result);
+        return 'updated';
     } catch (e) {
         console.error(LOG, e);
         toast.err(`อัปเดตไม่สำเร็จ: ${esc(e.message)}`);
+        return 'failed';
     } finally {
         busy = false;
     }
@@ -1965,6 +2004,113 @@ function addSettings() {
     host.append(wrap);
 }
 
+// ---------------------------------------------------------------- public API for other extensions
+//
+//   globalThis.CardUpdater.open({ avatar })  →  Promise<{ status: 'updated' | 'cancelled' | 'failed' }>
+//
+// Reverie (and any other extension) calls this from its own button's click handler. iOS Safari
+// opens a file picker only inside a user gesture, so open() clicks its file input before anything
+// asynchronous happens; the character is looked up again once the files are chosen.
+
+const PICK_GRACE_MS = 1500;
+
+/**
+ * Wait for the picker that `input.click()` is about to open. Resolves with the chosen files, or []
+ * when it was cancelled: the input's `cancel` event (Safari 16.4+, Chrome 113+), a `change` with no
+ * files, or — where neither comes — the window getting focus back with no files `graceMs` later.
+ * Files that arrive after that guess (iCloud files can take a while to download) go to `onLate`.
+ * `signal` aborts the wait (another open() call) and stops listening.
+ */
+function waitForPick(input, { win = globalThis, graceMs = PICK_GRACE_MS, signal, onLate } = {}) {
+    return new Promise(resolve => {
+        let settled = false;
+        let timer = null;
+        const settle = files => { if (!settled) { settled = true; resolve(files); } };
+        const stopFocus = () => { clearTimeout(timer); win.removeEventListener?.('focus', onFocus); };
+        const stop = () => {
+            stopFocus();
+            input.removeEventListener('change', onChange);
+            input.removeEventListener('cancel', onCancel);
+            signal?.removeEventListener('abort', onAbort);
+        };
+        function onChange() {
+            const files = [...(input.files ?? [])];
+            try { input.value = ''; } catch { /* ignore */ } // so the same file can be picked again
+            stop();
+            if (!settled) settle(files);
+            else if (files.length) onLate?.(files);
+        }
+        function onCancel() { stop(); settle([]); }
+        function onAbort() { stop(); settle([]); }
+        function onFocus() {
+            clearTimeout(timer);
+            timer = setTimeout(() => {
+                if (input.files?.length) return; // a change event is on its way
+                stopFocus(); // keep listening for a late change, though
+                settle([]);
+            }, graceMs);
+        }
+        if (signal?.aborted) { settle([]); return; }
+        input.addEventListener('change', onChange);
+        input.addEventListener('cancel', onCancel);
+        win.addEventListener?.('focus', onFocus);
+        signal?.addEventListener('abort', onAbort);
+    });
+}
+
+let apiInput = null;
+let apiPick = null; // AbortController of the last open() — aborted by the next one
+
+/** The file input open() clicks. Not display:none — some iOS versions won't open the picker for one. */
+function apiFileInput() {
+    if (apiInput?.isConnected) return apiInput;
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.id = 'cu_api_file';
+    input.className = 'cu_api_file';
+    input.tabIndex = -1;
+    input.setAttribute('aria-hidden', 'true');
+    document.body.append(input);
+    apiInput = input;
+    return input;
+}
+
+/**
+ * Start an update for the character stored as `avatar` (e.g. 'Alice.png'), or the open one when
+ * omitted. Call it straight from a click/tap handler. Never throws; resolves when the flow ends.
+ */
+function open({ avatar } = {}) {
+    try {
+        const target = avatar == null || avatar === '' ? undefined : String(avatar);
+        const why = blocker();
+        if (why) { toast.warn(why); return Promise.resolve({ status: 'failed' }); }
+        if (target !== undefined && findChid(target) === undefined) {
+            // Synchronous check, so the picker isn't opened for nothing.
+            return Promise.resolve(ctx().Popup.show.text('อัปเดตไม่ได้', notFoundText(target)))
+                .catch(() => {}).then(() => ({ status: 'failed' }));
+        }
+        const input = apiFileInput();
+        apiPick?.abort(); // an earlier open() whose picker never reported back: it was cancelled
+        const ctl = new AbortController();
+        apiPick = ctl;
+        const run = files => onFilesPicked(files, { avatar: target });
+        const picked = waitForPick(input, {
+            signal: ctl.signal,
+            onLate: files => { console.warn(LOG, 'files arrived after the picker looked cancelled'); run(files); },
+        });
+        input.click(); // still inside the caller's gesture — nothing above awaited
+        return picked
+            // apiPick stays set: after a guessed cancel this wait still listens for late files,
+            // and the next open() must stop it so one pick doesn't run twice.
+            .then(files => (files.length ? run(files) : 'cancelled'))
+            .then(status => ({ status }), e => { console.error(LOG, e); return { status: 'failed' }; });
+    } catch (e) {
+        console.error(LOG, 'open() failed', e);
+        return Promise.resolve({ status: 'failed' });
+    }
+}
+
 function init() {
     settings();
     addPanelButton();
@@ -2014,8 +2160,10 @@ async function reloadWithFreshFiles() {
     }
 }
 
-globalThis.CardUpdater = { VERSION, checkForNewVersion, reloadWithFreshFiles, readPngCard, writePngCard, cardInfo, jsonKind, loreDiff, mergeRegex, cardRegexAfter, onFilesPicked,
+// `version` and `open` are the public API (see above); the rest is for tests and debugging.
+// Set when the module loads (before init), so other extensions can find it as early as possible.
+globalThis.CardUpdater = { version: VERSION, open, VERSION, checkForNewVersion, reloadWithFreshFiles, readPngCard, writePngCard, cardInfo, jsonKind, loreDiff, mergeRegex, cardRegexAfter, onFilesPicked,
     cardManifest, compareVersions, isManagedCard, thSettingsOf, mergeScriptTrees, mergeCardRegex, mergeWorldEntries, staleCardEntries,
-    loreBaseName, versionFromFileName, versionedLoreName };
+    loreBaseName, versionFromFileName, versionedLoreName, waitForPick };
 
 if (typeof jQuery === 'function') jQuery(init); else init();
