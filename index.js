@@ -23,7 +23,7 @@
 
 const MODULE = 'card_updater';
 const LOG = '[CardUpdater]';
-const VERSION = '1.6.0'; // keep in sync with manifest.json
+const VERSION = '1.7.0'; // keep in sync with manifest.json
 const BASE_URL = new URL('.', import.meta.url);
 const CARD_EXT = ['png', 'json', 'charx', 'yaml', 'yml', 'byaf'];
 
@@ -36,6 +36,7 @@ const DEFAULTS = Object.freeze({
     useCardImage: true,        // Tavern Helper card (.png): take the new card's picture
     cardRegexMode: 'merge',    // new card: 'merge' keeps old scripts the card doesn't have | 'replace' uses the card's set
     managedLoreMode: 'modify', // Tavern Helper card: 'modify' the linked lorebook | 'clean' new versioned one from the card alone
+    updateTags: true,          // new card: the character's tags follow the card's
     loreFromFile: Object.freeze({}), // world name -> true when its last update came from a lorebook file
 });
 
@@ -149,6 +150,7 @@ function cardInfo(card) {
         world: String(d.extensions?.world ?? '').trim(),
         version: String(d.extensions?.card_updater?.version || d.character_version || '').trim(),
         regex,
+        tags: d.tags,
     };
 }
 
@@ -175,6 +177,134 @@ const globalRegex = () => (Array.isArray(ctx().extensionSettings.regex) ? ctx().
 function listNames(list, max = 6) {
     const shown = list.slice(0, max).map(n => `“${esc(n)}”`).join(', ');
     return list.length > max ? `${shown} และอีก ${list.length - max}` : shown;
+}
+
+// ---------------------------------------------------------------- tags
+//
+// SillyTavern shows a character's tags from its own list (`tag_map` in the settings, keyed by the
+// avatar file), not from the card's `tags` field. Only its own import screen copies one into the
+// other, so updating a card left the old tags on screen. After an update the list follows the card:
+//   • tags the new card has and the character doesn't get added (created first when they don't exist);
+//   • tags the old card had and the new one dropped get removed;
+//   • tags the player put on the character themselves stay.
+
+const TAG_SKIP = ['ROOT', 'TAVERN']; // what SillyTavern's own import skips
+const TAG_MAX = 50;
+/** Same matching as SillyTavern's tags: case and accents ignored. */
+const tagKey = s => String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '').trim().toLowerCase();
+
+/** A card's `tags` as clean names (trimmed, no duplicates), or null when the card has no tags field. */
+function cardTagNames(list) {
+    if (typeof list === 'string') list = list.split(',');
+    if (!Array.isArray(list)) return null;
+    const seen = new Set(), out = [];
+    for (const raw of list) {
+        const name = String(raw ?? '').trim();
+        const k = tagKey(name);
+        if (!name || TAG_SKIP.includes(name) || seen.has(k)) continue;
+        seen.add(k);
+        out.push(name);
+        if (out.length >= TAG_MAX) break;
+    }
+    return out;
+}
+
+/**
+ * How the character's tag list changes for a new card. `assigned`: the tag ids on the character now;
+ * `allTags`: every tag. Returns `{ add: names, remove: ids, removeNames }`, or null when the new card
+ * has no tags field (then the card's tags aren't changed either).
+ */
+function planTagSync({ oldTags, newTags, assigned, allTags }) {
+    const next = cardTagNames(newTags);
+    if (!next) return null;
+    const byId = new Map((Array.isArray(allTags) ? allTags : []).filter(t => t?.id != null).map(t => [String(t.id), t]));
+    const onChar = (Array.isArray(assigned) ? assigned : []).map(id => byId.get(String(id))).filter(Boolean);
+    const onKeys = new Set(onChar.map(t => tagKey(t.name)));
+    const nextKeys = new Set(next.map(tagKey));
+    const dropped = new Set((cardTagNames(oldTags) ?? []).map(tagKey).filter(k => !nextKeys.has(k)));
+    const remove = onChar.filter(t => dropped.has(tagKey(t.name)));
+    return { add: next.filter(n => !onKeys.has(tagKey(n))), remove: remove.map(t => String(t.id)), removeNames: remove.map(t => String(t.name)) };
+}
+
+const tagPlanFor = (avatar, oldTags, newTags) => planTagSync({ oldTags, newTags, assigned: ctx().tagMap?.[avatar], allTags: ctx().tags });
+const tagPlanEmpty = tp => !tp || (!tp.add.length && !tp.remove.length);
+
+function tagPlanText(tp) {
+    if (!tp) return 'การ์ดใหม่ไม่มีแท็ก — คงแท็กเดิมไว้';
+    if (tagPlanEmpty(tp)) return 'แท็กตรงกับการ์ดใหม่อยู่แล้ว';
+    const parts = [];
+    if (tp.add.length) parts.push(`เพิ่ม ${tp.add.length}: ${listNames(tp.add)}`);
+    if (tp.removeNames.length) parts.push(`เอาออก ${tp.removeNames.length}: ${listNames(tp.removeNames)}`);
+    return `${parts.join('<br>')}<br><small>แท็กที่ใส่เองคงไว้</small>`;
+}
+
+/** A tag in SillyTavern's shape (see newTag() in its tags.js). */
+function newTagObject(name, all) {
+    return {
+        id: newId(),
+        name,
+        folder_type: 'NONE',
+        filter_state: 'UNDEFINED',
+        sort_order: Math.max(0, ...all.map(t => Number(t?.sort_order) || 0)) + 1,
+        is_hidden_on_character_card: false,
+        color: '',
+        color2: '',
+        create_date: Date.now(),
+    };
+}
+
+/**
+ * Apply a tag plan to the character stored as `avatar`. Returns null when nothing changed, else
+ * `{ added, removed, undo }` — `undo` goes to undoTagSync(). The character list needs a redraw after.
+ */
+function applyTagSync(avatar, tp) {
+    const c = ctx();
+    const all = c.tags, map = c.tagMap;
+    if (tagPlanEmpty(tp) || !avatar || !Array.isArray(all) || !map || typeof map !== 'object') return null;
+    const before = Array.isArray(map[avatar]) ? [...map[avatar]] : null;
+    const list = before ? [...before] : [];
+    const created = [], added = [], removed = [];
+    for (const name of tp.add) {
+        let tag = all.find(t => tagKey(t?.name) === tagKey(name));
+        if (!tag) {
+            tag = newTagObject(name, all);
+            all.push(tag);
+            created.push(tag.id);
+        }
+        if (!list.includes(tag.id)) { list.push(tag.id); added.push(String(tag.name)); }
+    }
+    tp.remove.forEach((id, i) => {
+        const at = list.findIndex(x => String(x) === id);
+        if (at >= 0) { list.splice(at, 1); removed.push(tp.removeNames[i]); }
+    });
+    if (!added.length && !removed.length) {
+        for (const id of created) { const at = all.findIndex(t => t?.id === id); if (at >= 0) all.splice(at, 1); }
+        return null;
+    }
+    map[avatar] = list;
+    save();
+    return { added, removed, undo: { avatar, before, created } };
+}
+
+function undoTagSync(u) {
+    const c = ctx();
+    const all = c.tags, map = c.tagMap;
+    if (!u || !Array.isArray(all) || !map) return;
+    map[u.avatar] = u.before ? [...u.before] : [];
+    // Tags made by the update go again, unless something else got them since.
+    for (const id of u.created) {
+        if (Object.values(map).some(l => Array.isArray(l) && l.includes(id))) continue;
+        const at = all.findIndex(t => t?.id === id);
+        if (at >= 0) all.splice(at, 1);
+    }
+    save();
+}
+
+function tagReportText(r) {
+    const parts = [];
+    if (r.added.length) parts.push(`เพิ่ม ${listNames(r.added)}`);
+    if (r.removed.length) parts.push(`เอาออก ${listNames(r.removed)}`);
+    return `แท็ก: ${parts.join(' · ')}`;
 }
 
 // ---------------------------------------------------------------- lorebook comparison
@@ -562,12 +692,22 @@ function planDialog(items, old) {
             <label class="checkbox_label"><input type="checkbox" class="cu_allow"> อนุญาตให้ regex ของการ์ดนี้ทำงาน</label>
         </div>` : '';
 
+    // --- tags (SillyTavern's own tag list follows the card; see "tags" near the top)
+    const tagPlan = card && next ? tagPlanFor(old.avatar, old.tags, next.tags) : null;
+    const tagsBlock = card ? `
+        <div class="cu_section">
+            <div class="cu_head"><i class="fa-solid fa-tags"></i> แท็ก</div>
+            <div class="cu_note">${next ? tagPlanText(tagPlan) : 'จะเช็คหลังอัปโหลด'}</div>
+            ${!next || !tagPlanEmpty(tagPlan) ? '<label class="checkbox_label"><input type="checkbox" class="cu_tags"> อัปเดตแท็กตามการ์ดใหม่</label>' : ''}
+        </div>` : '';
+
     el.innerHTML = `
         <h3>${title}</h3>
         ${cardBlock}
         ${loreBlock}
         ${cardRegexBlock}
         ${regexBlock}
+        ${tagsBlock}
         <div class="cu_note">กด “ย้อนกลับ” ในหน้าสรุปได้ ถ้าเลือกผิดไฟล์</div>`;
 
     const $ = sel => el.querySelector(sel);
@@ -688,10 +828,12 @@ function planDialog(items, old) {
     }
     if (has('.cu_allow')) $('.cu_allow').checked = s.allowRegex;
     if (has('.cu_keep_avatar')) $('.cu_keep_avatar').checked = s.keepAvatar;
+    if (has('.cu_tags')) $('.cu_tags').checked = s.updateTags;
 
     const read = () => ({
         card: !!card,
         keepAvatar: $('.cu_keep_avatar')?.checked ?? s.keepAvatar,
+        tags: $('.cu_tags')?.checked ?? s.updateTags,
         lore: {
             source: loreFromFile ? 'file' : 'card',
             apply: !!$('.cu_lore')?.checked,
@@ -746,6 +888,7 @@ async function askPlan(items, old) {
     if (shown('.cu_allow')) s.allowRegex = plan.regex.allow;
     if (shown('.cu_card_rx_mode')) s.cardRegexMode = plan.regex.cardMode;
     if (shown('.cu_keep_avatar')) s.keepAvatar = plan.keepAvatar;
+    if (shown('.cu_tags')) s.updateTags = plan.tags;
     if (shown('.cu_rx_mode')) s.regexMode = plan.regex.mode;
     save();
     return plan;
@@ -810,7 +953,9 @@ async function runUpdate(items, old, plan) {
         globalRegex: null,
         allowed: old ? isRegexAllowed(old.avatar) : null,
         show: old ? old.isCurrent : undefined, // undo reopens the character only if it was open
+        tags: null,
     };
+    let tagsChanged = false;
 
     const loreAsNew = plan.lore.apply && plan.lore.mode === 'new';
     if (loreAsNew && worldNames().includes(plan.lore.target)) throw new Error(`มี lorebook ชื่อ “${plan.lore.target}” แล้ว — ยังไม่ได้แก้อะไร`);
@@ -842,6 +987,15 @@ async function runUpdate(items, old, plan) {
             report.push(format === 'png'
                 ? line('ok', 'ใช้รูปตัวละครเดิม')
                 : line(plan.keepAvatar ? 'warn' : 'info', 'รูปตัวละครเป็นรูปเริ่มต้น (ไฟล์ .json ไม่มีรูป)'));
+        }
+        // The import wrote the card's tags into the card only; the tag list on screen follows here.
+        if (plan.tags) {
+            const t = applyTagSync(old.avatar, tagPlanFor(old.avatar, old.tags, now.tags));
+            if (t) {
+                undo.tags = t.undo;
+                tagsChanged = true;
+                report.push(line('ok', tagReportText(t)));
+            }
         }
     }
 
@@ -969,6 +1123,9 @@ async function runUpdate(items, old, plan) {
         if (off) report.push(line('info', `ในไฟล์มี regex ที่ปิดไว้ ${off} ตัว`));
     }
 
+    // Redraw the character list so the new tags show.
+    if (tagsChanged) chid = (await reopen(old.avatar)) ?? chid;
+
     if (old?.isCurrent && chid !== undefined) {
         await showAgain(chid, old.chat);
         // A lorebook updated from its own file: let SillyTavern re-embed it in the card too, so exports carry it.
@@ -1017,6 +1174,7 @@ async function runUndo(undo) {
         notes.push('คืน global regex');
     }
     if (undo.avatar && undo.allowed !== null) setRegexAllowed(undo.avatar, undo.allowed);
+    if (undo.tags) { undoTagSync(undo.tags); notes.push('คืนแท็กเดิม'); }
     const chid = undo.avatar ? await reopen(undo.avatar) : undefined;
     // Tavern Helper still holds the updated scripts of the open card; hand it the old ones.
     if (chid !== undefined && undo.thTrees && typeof globalThis.TavernHelper?.replaceScriptTrees === 'function') {
@@ -1498,6 +1656,8 @@ async function managedPreview(chid, item) {
         scripts: mergeScriptTrees(thSettingsOf(od).settings.scripts, scriptsIn, byName),
         regex: mergeCardRegex(od.extensions?.regex_scripts, regexIn, byName),
         fields: CARD_DATA_FIELDS.filter(k => hasPath(nd, k) && !sameJson(getPath(nd, k), getPath(od, k))),
+        tags: tagPlanFor(ch.avatar, od.tags, nd.tags),
+        oldTags: structuredClone(od.tags), // the card's data changes during the update; this is the before
         allowed: isRegexAllowed(ch.avatar),
         hasTH: hasTavernHelper(),
     };
@@ -1575,10 +1735,17 @@ function managedDialog(p, item) {
             <div class="cu_note">${p.fields.length ? `เปลี่ยน: ${p.fields.map(f => `<code>${f}</code>`).join(', ')}` : 'ไม่มีอะไรเปลี่ยน'}${p.fields.includes('first_mes') ? '<br><small>ข้อความทักทายในแชทที่เล่นอยู่แล้วไม่เปลี่ยน</small>' : ''}</div>
             ${item.ext === 'png' ? '<label class="checkbox_label"><input type="checkbox" class="cu_card_image"> ใช้รูปจากการ์ดใหม่</label>' : '<div class="cu_note">รูปตัวละครคงเดิม</div>'}
         </div>
+        <div class="cu_section">
+            <div class="cu_head"><i class="fa-solid fa-tags"></i> แท็ก</div>
+            <div class="cu_note">${tagPlanText(p.tags)}</div>
+            ${tagPlanEmpty(p.tags) ? '' : '<label class="checkbox_label"><input type="checkbox" class="cu_tags"> อัปเดตแท็กตามการ์ดใหม่</label>'}
+        </div>
         <div class="cu_note">กด “ย้อนกลับ” ในหน้าสรุปได้ ถ้าเลือกผิดไฟล์</div>`;
 
     const img = el.querySelector('.cu_card_image');
     if (img) img.checked = s.useCardImage;
+    const tagsBox = el.querySelector('.cu_tags');
+    if (tagsBox) tagsBox.checked = s.updateTags;
     const mode = el.querySelector('.cu_lore_mode');
     const newWorld = el.querySelector('.cu_new_world');
     const worldHint = () => {
@@ -1602,16 +1769,17 @@ function managedDialog(p, item) {
     }
     const read = () => ({
         useImage: !!img?.checked,
+        tags: !!tagsBox?.checked,
         loreMode: mode?.value ?? 'modify',
         newWorld: newWorld?.value.trim() ?? '',
         removeEntries: mode?.value === 'clean' ? [] : [...el.querySelectorAll('.cu_stale_entry')].filter(x => x.checked).map(x => p.stale[Number(x.dataset.i)].name),
     });
-    return { el, read, showsImage: !!img, showsLoreMode: !!mode };
+    return { el, read, showsImage: !!img, showsLoreMode: !!mode, showsTags: !!tagsBox };
 }
 
 async function askManagedPlan(p, item) {
     const c = ctx();
-    const { el, read, showsImage, showsLoreMode } = managedDialog(p, item);
+    const { el, read, showsImage, showsLoreMode, showsTags } = managedDialog(p, item);
     let plan = null;
     await new c.Popup(el, c.POPUP_TYPE.CONFIRM, '', {
         okButton: 'อัปเดต',
@@ -1630,6 +1798,7 @@ async function askManagedPlan(p, item) {
     }).show();
     if (plan && showsImage) settings().useCardImage = plan.useImage;
     if (plan && showsLoreMode) settings().managedLoreMode = plan.loreMode;
+    if (plan && showsTags) settings().updateTags = plan.tags;
     if (plan) save();
     return plan;
 }
@@ -1654,6 +1823,7 @@ async function runManagedUpdate(item, p, plan) {
         globalRegex: null,
         allowed: null,
         thTrees: viaTH ? TH.getScriptTrees({ type: 'character' }) : null,
+        tags: null,
     };
     if (!undo.png) throw new Error('อ่านการ์ดเดิมจากเซิร์ฟเวอร์ไม่ได้ (ใช้ย้อนกลับ) — ยังไม่ได้แก้อะไร');
     const nd = cardData(item.card);
@@ -1776,14 +1946,26 @@ async function runManagedUpdate(item, p, plan) {
         if (!p.hasTH) report.push(line('warn', 'ยังไม่ได้ติดตั้ง <b>Tavern Helper (JS-Slash-Runner)</b> — ต้องติดตั้งก่อนบอทถึงจะทำงาน'));
         else if (!p.isCurrent) report.push(line('info', 'สคริปต์ใหม่จะทำงานเมื่อเปิดตัวละครนี้ครั้งถัดไป'));
     }
+    // 6. SillyTavern's tag list (the card's `tags` field went in with step 2)
+    let tagsChanged = false;
+    if (!failed && plan.tags) {
+        const t = applyTagSync(avatar, tagPlanFor(avatar, p.oldTags, nd.tags));
+        if (t) { undo.tags = t.undo; tagsChanged = true; report.push(line('ok', tagReportText(t))); }
+    }
     if (!failed && !p.newM) report.push(line('warn', 'การ์ดใหม่ไม่มี manifest — จับคู่ด้วยชื่อ ตรวจดูสคริปต์และ regex ว่าไม่ซ้ำ'));
     else if (!failed && !p.oldM) report.push(line('info', 'การ์ดเดิมไม่มี manifest — ครั้งนี้จับคู่ด้วยชื่อ บันทึก manifest แล้ว ครั้งต่อไปจับคู่ด้วย id'));
     report.push(line('info', 'ความคืบหน้าในแชทและตัวแปรของผู้เล่นไม่ถูกแตะ'));
     if (reloadHint) report.push(line('warn', 'เขียนสคริปต์ลงการ์ดโดยตรงขณะการ์ดเปิดอยู่ — <b>รีเฟรชหน้า</b>ก่อนเล่นต่อ'));
 
+    // Redraw the character list so the new tags show. Not while Tavern Helper's memory is out of step
+    // with the card (reloadHint): a reload of the list now could hand it the stale copy.
+    let shownChid = chid;
+    if (tagsChanged && !reloadHint) shownChid = (await reopen(avatar)) ?? chid;
+    else if (tagsChanged) report.push(line('info', 'แท็กใหม่จะแสดงในรายชื่อตัวละครหลังรีเฟรชหน้า'));
+
     // The character editor shows the old text; refresh it so its autosave can't write that back.
     if (p.isCurrent) {
-        try { await ctx().selectCharacterById(chid, { switchMenu: false }); } catch (e) { console.warn(LOG, 'could not refresh the editor', e); }
+        try { await ctx().selectCharacterById(shownChid, { switchMenu: false }); } catch (e) { console.warn(LOG, 'could not refresh the editor', e); }
     }
     const version = p.newM?.version || String(nd.character_version ?? '');
     return {
@@ -2164,6 +2346,6 @@ async function reloadWithFreshFiles() {
 // Set when the module loads (before init), so other extensions can find it as early as possible.
 globalThis.CardUpdater = { version: VERSION, open, VERSION, checkForNewVersion, reloadWithFreshFiles, readPngCard, writePngCard, cardInfo, jsonKind, loreDiff, mergeRegex, cardRegexAfter, onFilesPicked,
     cardManifest, compareVersions, isManagedCard, thSettingsOf, mergeScriptTrees, mergeCardRegex, mergeWorldEntries, staleCardEntries,
-    loreBaseName, versionFromFileName, versionedLoreName, waitForPick };
+    loreBaseName, versionFromFileName, versionedLoreName, waitForPick, cardTagNames, planTagSync, applyTagSync, undoTagSync };
 
 if (typeof jQuery === 'function') jQuery(init); else init();
