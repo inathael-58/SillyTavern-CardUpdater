@@ -23,7 +23,7 @@
 
 const MODULE = 'card_updater';
 const LOG = '[CardUpdater]';
-const VERSION = '1.7.0'; // keep in sync with manifest.json
+const VERSION = '1.7.1'; // keep in sync with manifest.json
 const BASE_URL = new URL('.', import.meta.url);
 const CARD_EXT = ['png', 'json', 'charx', 'yaml', 'yml', 'byaf'];
 
@@ -1567,6 +1567,26 @@ async function waitFor(test, ms) {
 
 const hasTavernHelper = () => typeof globalThis.TavernHelper?.updateScriptTreesWith === 'function';
 
+const treeIds = trees => flattenTrees(trees).map(x => String(x.id));
+
+/**
+ * Whether Tavern Helper's in-memory "character scripts" are this character's. Tavern Helper loads
+ * them when the chat moves to another character and writes its copy back over the card whenever it
+ * saves — a new chat with the same character does not reload them. Writing the card file behind its
+ * back leaves the old scripts running and lets its next save undo the update, so whenever its copy
+ * is this character's, the update has to go through Tavern Helper.
+ *   • open character: Tavern Helper follows the open chat — yes, unless its copy shares no script
+ *     with the card at all (it has clearly not caught up with the chat);
+ *   • another character: only when its copy is exactly this card's scripts and not the open
+ *     character's (a copy left over from when this character was last open).
+ */
+function thHoldsCharacter({ isCurrent, thTrees, cardTrees, openTrees = null }) {
+    const th = treeIds(thTrees), card = treeIds(cardTrees);
+    if (isCurrent) return !(th.length && card.length && !th.some(id => card.includes(id)));
+    if (!th.length || !sameJson(thTrees, cardTrees)) return false;
+    return !(openTrees && sameJson(thTrees, openTrees));
+}
+
 /**
  * Which character a Tavern Helper card updates: the ones whose manifest has the same bot_id, or
  * (without a manifest) the same name; the open character too unless its bot_id differs.
@@ -1807,10 +1827,16 @@ async function runManagedUpdate(item, p, plan) {
     const c = ctx();
     const TH = globalThis.TavernHelper;
     const { chid, avatar } = p;
-    const idsOf = trees => flattenTrees(trees).map(x => String(x.id)).sort();
-    // Tavern Helper's copy must be this character's (it follows the open chat).
-    const viaTH = p.isCurrent && hasTavernHelper()
-        && sameJson(idsOf(TH.getScriptTrees({ type: 'character' })), idsOf(thSettingsOf(ctx().characters[chid]?.data).settings.scripts));
+    // Tavern Helper keeps its own copy of the character's scripts: when it holds this character's,
+    // the scripts must go through it (see thHoldsCharacter), not straight into the card file.
+    const openChid = ctx().groupId ? undefined : ctx().characterId;
+    const viaTH = hasTavernHelper() && thHoldsCharacter({
+        isCurrent: p.isCurrent,
+        thTrees: TH.getScriptTrees({ type: 'character' }),
+        cardTrees: thSettingsOf(ctx().characters[chid]?.data).settings.scripts,
+        openTrees: openChid !== undefined && String(openChid) !== String(chid) && ctx().characters[openChid]
+            ? thSettingsOf(ctx().characters[openChid].data).settings.scripts : null,
+    });
     const report = [];
     const undo = {
         avatar,
@@ -2345,7 +2371,7 @@ async function reloadWithFreshFiles() {
 // `version` and `open` are the public API (see above); the rest is for tests and debugging.
 // Set when the module loads (before init), so other extensions can find it as early as possible.
 globalThis.CardUpdater = { version: VERSION, open, VERSION, checkForNewVersion, reloadWithFreshFiles, readPngCard, writePngCard, cardInfo, jsonKind, loreDiff, mergeRegex, cardRegexAfter, onFilesPicked,
-    cardManifest, compareVersions, isManagedCard, thSettingsOf, mergeScriptTrees, mergeCardRegex, mergeWorldEntries, staleCardEntries,
+    cardManifest, compareVersions, isManagedCard, thSettingsOf, thHoldsCharacter, mergeScriptTrees, mergeCardRegex, mergeWorldEntries, staleCardEntries,
     loreBaseName, versionFromFileName, versionedLoreName, waitForPick, cardTagNames, planTagSync, applyTagSync, undoTagSync };
 
 if (typeof jQuery === 'function') jQuery(init); else init();
